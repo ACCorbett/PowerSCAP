@@ -1,4 +1,3 @@
-
 <#
 .SYNOPSIS
   PowerSCAP - Robust SCAP/OVAL evaluator for common Windows checks (registry, WMI/CIM, file, service, process, QFE)
@@ -26,11 +25,22 @@
 .PARAMETER Prefer64BitRegistry
   Prefer 64-bit registry view (default: $true). Set to $false to use process-default.
 
+.VERSION
+    Version = '1.1.0'  # Major.Minor.Patch 
+
+.AUTHOR
+    Adam Corbett
+
 .NOTES
-  PowerShell 5.1 compatible. No PS 7-only operators (??, ?:).
+  Dropping PowerShell 5.1 compatible; moving to PowerShell 7+ only. 
 
   KEY FIXES:
-    - First Beta
+    - Fixed no rows issue in Evaluate-WMITest
+    - Fixed Evaluate-AccessTokenTest 
+    - Added Evaluate-GroupTest and corisponding helper functions. **UNTESTED**
+    - Changed Function order for better organization
+    - Other minor fixes and improvements
+
 #>
 
 [CmdletBinding()]
@@ -332,43 +342,6 @@ function Compare-Value {
     }
 }
 
-
-# --- Registry helpers --------------------------------------------------------
-
-function Get-RegistryItemProperty {
-    param(
-        [string]$Hive,
-        [string]$Key,
-        [string]$Name
-    )
-    $mappedHive = $Hive -replace '^HKEY_LOCAL_MACHINE$', 'HKLM:' -replace '^HKEY_CURRENT_USER$', 'HKCU:' -replace '^HKEY_USERS$', 'HKU:' -replace '^HKEY_CLASSES_ROOT$', 'HKCR:'
-    $regPath = "$mappedHive\$Key"
-
-    $baseKey = $null
-    $registryView = [Microsoft.Win32.RegistryView]::Default
-    if ($Prefer64BitRegistry) { $registryView = [Microsoft.Win32.RegistryView]::Registry64 }
-
-    try {
-        if ($regPath.StartsWith('HKLM:')) {
-            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $registryView)
-        } elseif ($regPath.StartsWith('HKCU:')) {
-            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $registryView)
-        } elseif ($regPath.StartsWith('HKU:')) {
-            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, $registryView)
-        } elseif ($regPath.StartsWith('HKCR:')) {
-            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::ClassesRoot, $registryView)
-        } else {
-            return (Get-ItemProperty -Path $regPath -Name $Name -ErrorAction Stop).$Name
-        }
-
-        $subKey = $baseKey.OpenSubKey($Key)
-        if (-not $subKey) { return $null }
-        return $subKey.GetValue($Name, $null)
-    } catch {
-        return $null
-    }
-}
-
 # --- Test ref resolver (supports both styles) --------------------------------
 
 function Get-TestRefs {
@@ -555,80 +528,84 @@ function Map-OvalAuditExpectation {
     }
 }
 
-function Evaluate-AuditEventPolicySubcategoriesTest {
-    param([System.Xml.XmlNode]$test)
+# --- Local group helpers -----------------------------------------------------
+function Get-LocalGroupMembers {
+    param([Parameter(Mandatory=$true)][string]$GroupName)
 
-    $refs = Get-TestRefs -test $test
-    $objectRefId = $refs.objectRefId
-    $stateRefId  = $refs.stateRefId
-
-    $obj = $null
-    if ($objectRefId -and $objects.ContainsKey($objectRefId)) { $obj = $objects[$objectRefId] }
-    $stateNode = $null
-    if ($stateRefId -and $states.ContainsKey($stateRefId)) { $stateNode = $states[$stateRefId] }
-
-    if (-not $obj) { return [pscustomobject]@{ Type='AuditPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Audit policy object not found: $objectRefId" } }
-    if (-not $stateNode) { return [pscustomobject]@{ Type='AuditPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Audit policy state not found: $stateRefId" } }
-
-    $subcategoryMap = @{
-        'sensitive_privilege_use'     = 'Sensitive Privilege Use'
-        'logon'                       = 'Logon'
-        'logoff'                      = 'Logoff'
-        'account_lockout'             = 'Account Lockout'
-        'special_logon'               = 'Special Logon'
-        'other_object_access_events'  = 'Other Object Access Events'
-        'handle_manipulation'         = 'Handle Manipulation'
-        'registry'                    = 'Registry'
-        'file_system'                 = 'File System'
-        'process_creation'            = 'Process Creation'
-        'security_state_change'       = 'Security State Change'
-        'security_system_extension'   = 'Security System Extension'
-        'system_integrity'            = 'System Integrity'
-        'audit_policy_change'         = 'Audit Policy Change'
-        'authentication_policy_change'= 'Authentication Policy Change'
-        'authorization_policy_change' = 'Authorization Policy Change'
-        'directory_service_access'    = 'Directory Service Access'
-        'directory_service_changes'   = 'Directory Service Changes'
-        'computer_account_management' = 'Computer Account Management'
-        'user_account_management'     = 'User Account Management'
-        'security_group_management'   = 'Security Group Management'
-        'credential_validation'       = 'Credential Validation'
-        'ipsec_driver'                = 'IPsec Driver'
-        'other_system_events'         = 'Other System Events'
-    }
-
-    $results = @()
-    foreach ($child in $stateNode.ChildNodes) {
-        if (-not ($child -is [System.Xml.XmlElement])) { continue }
-        $fieldName = $child.LocalName
-        $expectedLiteral = (Get-InnerText $child)
-
-        $expectedCanonical = Map-OvalAuditExpectation -OvalValue $expectedLiteral
-        if (-not $expectedCanonical) { $expectedCanonical = ($expectedLiteral -replace '_',' ').Trim() }
-
-        $subcategory = $subcategoryMap[$fieldName]
-        if (-not $subcategory) { $subcategory = ($fieldName -replace '_',' ').Trim() }
-
-        $actualInfo = Get-AuditSubcategorySetting -Subcategory $subcategory
-        $actualCanonical = $actualInfo.SettingString
-        $pass = ($actualCanonical.Trim().ToUpperInvariant() -eq $expectedCanonical.Trim().ToUpperInvariant())
-
-        $results += [pscustomobject]@{
-            Type        = 'AuditPolicy'
-            Subcategory = $subcategory
-            Expected    = $expectedCanonical
-            Actual      = $actualCanonical
-            Pass        = $pass
-            Evidence    = "auditpol.exe /get /subcategory:`"$subcategory`" => $($actualInfo.SettingString); SuccessEnabled=$($actualInfo.SuccessEnabled); FailureEnabled=$($actualInfo.FailureEnabled)"
-            RawOutput   = $actualInfo.Raw
+    # Prefer built-in cmdlet (PS 5.1+, Windows 10+/Server 2016+)
+    if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
+        try {
+            $members = @(Get-LocalGroupMember -Group $GroupName -ErrorAction Stop)
+            return $members | ForEach-Object {
+                [pscustomobject]@{
+                    Name            = $_.Name
+                    SID             = $_.SID
+                    PrincipalSource = $_.PrincipalSource
+                }
+            }
+        } catch {
+            # fall through to ADSI
         }
     }
 
-    $overallPass = (($results | Where-Object { -not $_.Pass }) | Measure-Object).Count -eq 0
-    return [pscustomobject]@{
-        Type     = 'AuditPolicy'
-        Pass     = $overallPass
-        Details  = $results
+    # Fallback: WinNT ADSI provider
+    try {
+        $ads = [ADSI]"WinNT://$env:COMPUTERNAME/$GroupName,group"
+        $list = @()
+        foreach ($m in $ads.psbase.Invoke('Members')) {
+            $name    = $m.GetType().InvokeMember('Name', 'GetProperty', $null, $m, $null)
+            $adsPath = $m.GetType().InvokeMember('ADsPath', 'GetProperty', $null, $m, $null)
+            # Best-effort SID resolution
+            $sid = $null
+            try {
+                $nt = New-Object System.Security.Principal.NTAccount($name)
+                $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            } catch { }
+            $list += [pscustomobject]@{
+                Name = $name
+                SID  = $sid
+                ADsPath = $adsPath
+            }
+        }
+        return $list
+    } catch {
+        return @()
+    }
+}
+
+# --- Registry helpers --------------------------------------------------------
+
+function Get-RegistryItemProperty {
+    param(
+        [string]$Hive,
+        [string]$Key,
+        [string]$Name
+    )
+    $mappedHive = $Hive -replace '^HKEY_LOCAL_MACHINE$', 'HKLM:' -replace '^HKEY_CURRENT_USER$', 'HKCU:' -replace '^HKEY_USERS$', 'HKU:' -replace '^HKEY_CLASSES_ROOT$', 'HKCR:'
+    $regPath = "$mappedHive\$Key"
+
+    $baseKey = $null
+    $registryView = [Microsoft.Win32.RegistryView]::Default
+    if ($Prefer64BitRegistry) { $registryView = [Microsoft.Win32.RegistryView]::Registry64 }
+
+    try {
+        if ($regPath.StartsWith('HKLM:')) {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $registryView)
+        } elseif ($regPath.StartsWith('HKCU:')) {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, $registryView)
+        } elseif ($regPath.StartsWith('HKU:')) {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::Users, $registryView)
+        } elseif ($regPath.StartsWith('HKCR:')) {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::ClassesRoot, $registryView)
+        } else {
+            return (Get-ItemProperty -Path $regPath -Name $Name -ErrorAction Stop).$Name
+        }
+
+        $subKey = $baseKey.OpenSubKey($Key)
+        if (-not $subKey) { return $null }
+        return $subKey.GetValue($Name, $null)
+    } catch {
+        return $null
     }
 }
 
@@ -691,7 +668,7 @@ function Get-LocalAccountNameBySid {
 }
 
 
-# --- New: Account Lockout Policy evaluator ----------------------------------
+# --- Account Lockout Policy evaluator ----------------------------------
 
 function Get-SystemAccessPolicy {
     <#
@@ -789,158 +766,53 @@ function Evaluate-WMITest {
     $refs = Get-TestRefs -test $test
     $objectRefId = $refs.objectRefId
     $stateRefId  = $refs.stateRefId
-    
+
     $obj = $null
     if ($objectRefId -and $objects.ContainsKey($objectRefId)) { $obj = $objects[$objectRefId] }
     $stateNode = $null
     if ($stateRefId -and $states.ContainsKey($stateRefId)) { $stateNode = $states[$stateRefId] }
-    
+
     if (-not $obj) { return [pscustomobject]@{ Type='WMI'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="WMI object not found: $objectRefId" } }
 
     $namespace = Get-InnerText (Select-XmlNode -Xml $obj -XPath "./*[local-name()='namespace']")
     $wql       = Get-InnerText (Select-XmlNode -Xml $obj -XPath "./*[local-name()='wql']")
 
-    if ([string]::IsNullOrWhiteSpace($namespace) -or [string]::IsNullOrWhiteSpace($wql)) {
-        return [pscustomobject]@{
-            Type='WMI'; Namespace=$namespace; WQL=$wql
-            Expected='N/A'; Actual='N/A'; Pass=$false
-            Evidence='Missing namespace or WQL in WMI object.'
-        }
-    }
+    $checkExistence = Get-AttrValue -Node $test -Name 'check_existence'
+    $comment = Get-AttrValue -Node $test -Name 'comment'
 
-    # Existence-only if no state
-    if (-not $stateNode) {
-        $checkExistence = Get-AttrValue -Node $test -Name 'check_existence'
-        $rows = @(Invoke-WmiQuery -Namespace $namespace -Query $wql -MaxRows $MaxWmiRows -UseCim $UseCim)
-        $rowCount = ($rows | Measure-Object).Count
-        
-        $pass = $false
-        switch ($checkExistence) {
-            'all_exist' { $pass = ($rowCount -gt 0) }
-            'any_exist' { $pass = ($rowCount -gt 0) }
-            'at_least_one_exists' { $pass = ($rowCount -gt 0) }
-            'none_exist' { $pass = ($rowCount -eq 0) }
-            'only_one_exists' { $pass = ($rowCount -eq 1) }
-            default { $pass = ($rowCount -gt 0) }
-        }
-        
-        return [pscustomobject]@{
-            Type='WMI'; Namespace=$namespace; WQL=$wql
-            Expected="check_existence=$checkExistence"
-            Actual="rows=$rowCount"
-            Pass=$pass
-            Evidence="Query returned $rowCount row(s), check_existence=$checkExistence"
-        }
-    }
-
-    # Handle tests with states (value comparisons)
-    $resultNode = Select-XmlNode -Xml $stateNode -XPath "./*[local-name()='result']"
-    if (-not $resultNode) {
-        return [pscustomobject]@{
-            Type='WMI'; Namespace=$namespace; WQL=$wql
-            Expected='N/A'; Actual='N/A'; Pass=$false
-            Evidence='No result node in state'
-        }
-    }
-
-    $fieldNodes = Select-XmlNodes -Xml $resultNode -XPath "./*[local-name()='field']"
     $rows = @(Invoke-WmiQuery -Namespace $namespace -Query $wql -MaxRows $MaxWmiRows -UseCim $UseCim)
-    $rowsCount = ($rows | Measure-Object).Count
-    
-    if ($rowsCount -eq 0) {
-        $checkExistence = Get-AttrValue -Node $test -Name 'check_existence'
-        if ($checkExistence -eq 'none_exist') {
-            return [pscustomobject]@{
-                Type='WMI'; Namespace=$namespace; WQL=$wql
-                Expected='No rows'; Actual='No rows'; Pass=$true
-                Evidence='No rows returned (as expected)'
-            }
-        }
+    $rowCount = ($rows | Measure-Object).Count
+
+    # If the test is for "should not exist" (e.g., Fax Server not installed)
+    $shouldNotExist = $false
+    if ($checkExistence -eq 'none_exist' -or
+        ($comment -match 'not installed' -or $comment -match 'not present' -or $comment -match 'should not exist')) {
+        $shouldNotExist = $true
+    }
+
+    if ($shouldNotExist) {
+        $pass = ($rowCount -eq 0)
         return [pscustomobject]@{
-            Type='WMI'; Namespace=$namespace; WQL=$wql
-            Expected='Data rows'; Actual='No rows'; Pass=$false
-            Evidence='No rows returned from WMI query'
+            Type     = 'WMI'
+            Namespace= $namespace
+            WQL      = $wql
+            Expected = "No rows (service/process/feature not present)"
+            Actual   = if ($rowCount -eq 0) { "No rows" } else { "$rowCount row(s)" }
+            Pass     = $pass
+            Evidence = "Query returned $rowCount row(s); expected none"
         }
     }
 
-    # Process field-based checks
-    $allFieldsPass = $true
-    $fieldResults = @()
-    
-    foreach ($fieldNode in $fieldNodes) {
-        $fieldName = Get-AttrValue -Node $fieldNode -Name 'name'
-        $expected = Get-InnerText $fieldNode
-        $operation = Get-AttrValue -Node $fieldNode -Name 'operation'; if (-not $operation) { $operation = 'equals' }
-        $datatype = Get-AttrValue -Node $fieldNode -Name 'datatype'; if (-not $datatype) { $datatype = 'string' }
-        $entityCheck = Get-AttrValue -Node $fieldNode -Name 'entity_check'; if (-not $entityCheck) { $entityCheck = 'all' }
-        
-        $fieldPass = $false
-        $actualValues = @()
-        
-        foreach ($row in $rows) {
-            if ($row.PSObject.Properties.Match($fieldName).Count -gt 0) {
-                $actualValues += $row.$fieldName
-            }
-        }
-        
-        switch ($entityCheck) {
-            'all' {
-                $fieldPass = $true
-                foreach ($val in $actualValues) {
-                    if (-not (Compare-Value -Actual $val -Expected $expected -Operation $operation -Datatype $datatype)) {
-                        $fieldPass = $false
-                        break
-                    }
-                }
-            }
-            'at least one' {
-                $fieldPass = $false
-                foreach ($val in $actualValues) {
-                    if (Compare-Value -Actual $val -Expected $expected -Operation $operation -Datatype $datatype) {
-                        $fieldPass = $true
-                        break
-                    }
-                }
-            }
-            'none satisfy' {
-                $fieldPass = $true
-                foreach ($val in $actualValues) {
-                    if (Compare-Value -Actual $val -Expected $expected -Operation $operation -Datatype $datatype) {
-                        $fieldPass = $false
-                        break
-                    }
-                }
-            }
-            'only one' {
-                $matchCount = 0
-                foreach ($val in $actualValues) {
-                    if (Compare-Value -Actual $val -Expected $expected -Operation $operation -Datatype $datatype) {
-                        $matchCount++
-                    }
-                }
-                $fieldPass = ($matchCount -eq 1)
-            }
-            default {
-                $fieldPass = $true
-                foreach ($val in $actualValues) {
-                    if (-not (Compare-Value -Actual $val -Expected $expected -Operation $operation -Datatype $datatype)) {
-                        $fieldPass = $false
-                        break
-                    }
-                }
-            }
-        }
-        
-        $fieldResults += "$fieldName=$($actualValues -join ',')"
-        if (-not $fieldPass) { $allFieldsPass = $false }
-    }
-
+    # Default: existence is required
+    $pass = ($rowCount -gt 0)
     return [pscustomobject]@{
-        Type='WMI'; Namespace=$namespace; WQL=$wql
-        Expected="Field checks per state"
-        Actual=($fieldResults -join '; ')
-        Pass=$allFieldsPass
-        Evidence="Rows=$rowsCount, fields checked=$((@($fieldNodes) | Measure-Object).Count)"
+        Type     = 'WMI'
+        Namespace= $namespace
+        WQL      = $wql
+        Expected = "At least one row"
+        Actual   = "$rowCount row(s)"
+        Pass     = $pass
+        Evidence = "Query returned $rowCount row(s)"
     }
 }
 
@@ -1251,8 +1123,6 @@ function Evaluate-QfeTest {
     }
 }
 
-
-
 function Evaluate-SidSidTest {
     param([System.Xml.XmlNode]$test)
 
@@ -1319,7 +1189,6 @@ function Evaluate-SidSidTest {
     }
 }
 
-
 function Evaluate-AccessTokenTest {
     param([System.Xml.XmlNode]$test)
 
@@ -1336,7 +1205,10 @@ function Evaluate-AccessTokenTest {
     if (-not $stateNode) { return [pscustomobject]@{ Type='AccessToken'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="AccessToken state not found: $stateRefId" } }
 
     # Find which privilege is being checked
-    $privNode = $stateNode.ChildNodes | Where-Object { $_.LocalName -like '*privilege' }
+
+    $privNode = $stateNode.ChildNodes | Where-Object {
+        $_.LocalName -like '*privilege' -or $_.LocalName -like '*right'
+    }
     if ($privNode -is [System.Collections.IEnumerable] -and -not ($privNode -is [string])) { $privNode = $privNode | Select-Object -First 1 }
     if (-not $privNode) {
         return [pscustomobject]@{ Type='AccessToken'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="No privilege node found in state" }
@@ -1388,9 +1260,313 @@ function Evaluate-AccessTokenTest {
         Evidence = "Privilege $right assigned to: $($actualSIDs -join ', ') (expected $($expectedSIDs -join ', '))"
     }
 }
+function Evaluate-AuditEventPolicySubcategoriesTest {
+    param([System.Xml.XmlNode]$test)
 
-# --- New: AccessToken test evaluator ----------------------------------------
+    $refs = Get-TestRefs -test $test
+    $objectRefId = $refs.objectRefId
+    $stateRefId  = $refs.stateRefId
 
+    $obj = $null
+    if ($objectRefId -and $objects.ContainsKey($objectRefId)) { $obj = $objects[$objectRefId] }
+    $stateNode = $null
+    if ($stateRefId -and $states.ContainsKey($stateRefId)) { $stateNode = $states[$stateRefId] }
+
+    if (-not $obj) { return [pscustomobject]@{ Type='AuditPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Audit policy object not found: $objectRefId" } }
+    if (-not $stateNode) { return [pscustomobject]@{ Type='AuditPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Audit policy state not found: $stateRefId" } }
+
+    $subcategoryMap = @{
+        'sensitive_privilege_use'     = 'Sensitive Privilege Use'
+        'logon'                       = 'Logon'
+        'logoff'                      = 'Logoff'
+        'account_lockout'             = 'Account Lockout'
+        'special_logon'               = 'Special Logon'
+        'other_object_access_events'  = 'Other Object Access Events'
+        'handle_manipulation'         = 'Handle Manipulation'
+        'registry'                    = 'Registry'
+        'file_system'                 = 'File System'
+        'process_creation'            = 'Process Creation'
+        'security_state_change'       = 'Security State Change'
+        'security_system_extension'   = 'Security System Extension'
+        'system_integrity'            = 'System Integrity'
+        'audit_policy_change'         = 'Audit Policy Change'
+        'authentication_policy_change'= 'Authentication Policy Change'
+        'authorization_policy_change' = 'Authorization Policy Change'
+        'directory_service_access'    = 'Directory Service Access'
+        'directory_service_changes'   = 'Directory Service Changes'
+        'computer_account_management' = 'Computer Account Management'
+        'user_account_management'     = 'User Account Management'
+        'security_group_management'   = 'Security Group Management'
+        'credential_validation'       = 'Credential Validation'
+        'ipsec_driver'                = 'IPsec Driver'
+        'other_system_events'         = 'Other System Events'
+    }
+
+    $results = @()
+    foreach ($child in $stateNode.ChildNodes) {
+        if (-not ($child -is [System.Xml.XmlElement])) { continue }
+        $fieldName = $child.LocalName
+        $expectedLiteral = (Get-InnerText $child)
+
+        $expectedCanonical = Map-OvalAuditExpectation -OvalValue $expectedLiteral
+        if (-not $expectedCanonical) { $expectedCanonical = ($expectedLiteral -replace '_',' ').Trim() }
+
+        $subcategory = $subcategoryMap[$fieldName]
+        if (-not $subcategory) { $subcategory = ($fieldName -replace '_',' ').Trim() }
+
+        $actualInfo = Get-AuditSubcategorySetting -Subcategory $subcategory
+        $actualCanonical = $actualInfo.SettingString
+        $pass = ($actualCanonical.Trim().ToUpperInvariant() -eq $expectedCanonical.Trim().ToUpperInvariant())
+
+        $results += [pscustomobject]@{
+            Type        = 'AuditPolicy'
+            Subcategory = $subcategory
+            Expected    = $expectedCanonical
+            Actual      = $actualCanonical
+            Pass        = $pass
+            Evidence    = "auditpol.exe /get /subcategory:`"$subcategory`" => $($actualInfo.SettingString); SuccessEnabled=$($actualInfo.SuccessEnabled); FailureEnabled=$($actualInfo.FailureEnabled)"
+            RawOutput   = $actualInfo.Raw
+        }
+    }
+
+    $overallPass = (($results | Where-Object { -not $_.Pass }) | Measure-Object).Count -eq 0
+    return [pscustomobject]@{
+        Type     = 'AuditPolicy'
+        Pass     = $overallPass
+        Details  = $results
+    }
+}
+
+function Evaluate-GroupTest {
+    param([System.Xml.XmlNode]$test)
+
+    # Resolve refs
+    $refs = Get-TestRefs -test $test
+    $objectRefId = $refs.objectRefId
+    $stateRefId  = $refs.stateRefId
+
+    $obj = $null
+    if ($objectRefId -and $objects.ContainsKey($objectRefId)) { $obj = $objects[$objectRefId] }
+    $stateNode = $null
+    if ($stateRefId -and $states.ContainsKey($stateRefId)) { $stateNode = $states[$stateRefId] }
+
+    if (-not $obj) { 
+        return [pscustomobject]@{ Type='Group'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Group object not found: $objectRefId" } 
+    }
+
+    # Object: group_name or group_sid (support var_ref)
+    $groupNameNode = Select-XmlNode -Xml $obj -XPath "./*[local-name()='group_name' or local-name()='name']"
+    $groupSidNode  = Select-XmlNode -Xml $obj -XPath "./*[local-name()='group_sid' or local-name()='sid']"
+    $groupName     = Get-InnerText $groupNameNode
+    $groupSid      = Get-InnerText $groupSidNode
+
+    $groupNameVarRef = Get-AttrValue -Node $groupNameNode -Name 'var_ref'
+    if ($groupNameVarRef) {
+        $vals = Resolve-VarRef -VarRef $groupNameVarRef
+        if ($vals -and $vals.Count -gt 0) { $groupName = $vals[0] } # Use first for selection
+    }
+    $groupSidVarRef = Get-AttrValue -Node $groupSidNode -Name 'var_ref'
+    if ($groupSidVarRef) {
+        $vals = Resolve-VarRef -VarRef $groupSidVarRef
+        if ($vals -and $vals.Count -gt 0) { $groupSid = $vals[0] }
+    }
+
+    # Locate the group via CIM
+    $group = $null
+    try {
+        if ($groupSid) {
+            $group = Get-CimInstance -ClassName Win32_Group -Filter "SID='$groupSid'" -ErrorAction SilentlyContinue
+        }
+        if (-not $group -and $groupName) {
+            # Prefer local group, but allow any group match
+            $group = Get-CimInstance -ClassName Win32_Group -Filter "Name='$groupName'" -ErrorAction SilentlyContinue
+            if (-not $group) {
+                # Last resort: search all and match case-insensitive
+                $group = Get-CimInstance -ClassName Win32_Group -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $groupName } | Select-Object -First 1
+            }
+        }
+    } catch { }
+
+    # Existence-only if no state
+    if (-not $stateNode) {
+        $checkExistence = Get-AttrValue -Node $test -Name 'check_existence'
+        $exists = ($null -ne $group)
+        $pass = $false
+        switch ($checkExistence) {
+            'none_exist'          { $pass = (-not $exists) }
+            'only_one_exists'     { $pass = $exists } # single entity context; treat as exists
+            'at_least_one_exists' { $pass = $exists }
+            'any_exist'           { $pass = $exists }
+            default               { $pass = $exists } # default: require existence
+        }
+        return [pscustomobject]@{
+            Type     = 'Group'
+            GroupName= $groupName
+            GroupSID = $groupSid
+            Expected = "check_existence=$checkExistence"
+            Actual   = "exists=$exists"
+            Pass     = $pass
+            Evidence = if ($group) { "Found group: Name=$($group.Name), SID=$($group.SID), Domain=$($group.Domain), LocalAccount=$($group.LocalAccount)" } else { "Group not found" }
+        }
+    }
+
+    # With state: evaluate properties and membership
+    if (-not $group) {
+        return [pscustomobject]@{
+            Type='Group'; Pass=$false; Expected='State checks'; Actual='Group missing'
+            Evidence="Group not found; cannot evaluate state ($($groupName ?? $groupSid))"
+        }
+    }
+
+    # Pull members
+    $members = @(Get-LocalGroupMembers -GroupName $group.Name)
+    $memberSIDs  = @($members | ForEach-Object { $_.SID } | Where-Object { $_ })
+    $memberNames = @($members | ForEach-Object { $_.Name } | Where-Object { $_ })
+
+    # Helper: evaluate entity_check against actual values & expected(s)
+    function Evaluate-EntityCheck {
+        param(
+            [object[]]$ActualValues,
+            [object[]]$ExpectedValues,
+            [string]$Operation = 'equals',
+            [string]$Datatype = 'string',
+            [string]$EntityCheck = 'at least one'
+        )
+        # flatten
+        $ActualValues   = @($ActualValues | Where-Object { $_ -ne $null -and $_ -ne '' })
+        $ExpectedValues = @($ExpectedValues | Where-Object { $_ -ne $null -and $_ -ne '' })
+
+        switch ($EntityCheck) {
+            'all' {
+                # Every actual must match at least one expected
+                foreach ($a in $ActualValues) {
+                    $matched = $false
+                    foreach ($e in $ExpectedValues) {
+                        if (Compare-Value -Actual $a -Expected $e -Operation $Operation -Datatype $Datatype) { $matched = $true; break }
+                    }
+                    if (-not $matched) { return $false }
+                }
+                return $true
+            }
+            'none satisfy' {
+                foreach ($a in $ActualValues) {
+                    foreach ($e in $ExpectedValues) {
+                        if (Compare-Value -Actual $a -Expected $e -Operation $Operation -Datatype $Datatype) { return $false }
+                    }
+                }
+                return $true
+            }
+            'only one' {
+                $count = 0
+                foreach ($a in $ActualValues) {
+                    foreach ($e in $ExpectedValues) {
+                        if (Compare-Value -Actual $a -Expected $e -Operation $Operation -Datatype $Datatype) { $count++; break }
+                    }
+                }
+                return ($count -eq 1)
+            }
+            default { # 'at least one'
+                foreach ($a in $ActualValues) {
+                    foreach ($e in $ExpectedValues) {
+                        if (Compare-Value -Actual $a -Expected $e -Operation $Operation -Datatype $Datatype) { return $true }
+                    }
+                }
+                return $false
+            }
+        }
+    }
+
+    $results = @()
+    $allPass = $true
+
+    # -- group_name state
+    $stGroupName = Select-XmlNode -Xml $stateNode -XPath "./*[local-name()='group_name' or local-name()='name']"
+    if ($stGroupName) {
+        $exp = Get-InnerText $stGroupName
+        $op  = Get-AttrValue -Node $stGroupName -Name 'operation'; if (-not $op) { $op = 'equals' }
+        $dt  = Get-AttrValue -Node $stGroupName -Name 'datatype';  if (-not $dt) { $dt = 'string' }
+        $expVar = Get-AttrValue -Node $stGroupName -Name 'var_ref'
+        $expVals = @($exp)
+        if ($expVar) { $tmp = Resolve-VarRef -VarRef $expVar; if ($tmp) { $expVals = $tmp } }
+        $pass = Evaluate-EntityCheck -ActualValues @($group.Name) -ExpectedValues $expVals -Operation $op -Datatype $dt -EntityCheck 'at least one'
+        if (-not $pass) { $allPass = $false }
+        $results += [pscustomobject]@{ Type='Group'; Field='group_name'; Expected=($expVals -join ', '); Actual=$group.Name; Pass=$pass; Evidence="op=$op, datatype=$dt" }
+    }
+
+    # -- group_sid state
+    $stGroupSid = Select-XmlNode -Xml $stateNode -XPath "./*[local-name()='group_sid' or local-name()='sid']"
+    if ($stGroupSid) {
+        $exp = Get-InnerText $stGroupSid
+        $op  = Get-AttrValue -Node $stGroupSid -Name 'operation'; if (-not $op) { $op = 'equals' }
+        $dt  = Get-AttrValue -Node $stGroupSid -Name 'datatype';  if (-not $dt) { $dt = 'string' }
+        $expVar = Get-AttrValue -Node $stGroupSid -Name 'var_ref'
+        $expVals = @($exp)
+        if ($expVar) { $tmp = Resolve-VarRef -VarRef $expVar; if ($tmp) { $expVals = $tmp } }
+        $pass = Evaluate-EntityCheck -ActualValues @($group.SID) -ExpectedValues $expVals -Operation $op -Datatype $dt -EntityCheck 'at least one'
+        if (-not $pass) { $allPass = $false }
+        $results += [pscustomobject]@{ Type='Group'; Field='group_sid'; Expected=($expVals -join ', '); Actual=$group.SID; Pass=$pass; Evidence="op=$op, datatype=$dt" }
+    }
+
+    # -- domain state
+    $stDomain = Select-XmlNode -Xml $stateNode -XPath "./*[local-name()='domain']"
+    if ($stDomain) {
+        $exp = Get-InnerText $stDomain
+        $op  = Get-AttrValue -Node $stDomain -Name 'operation'; if (-not $op) { $op = 'equals' }
+        $dt  = Get-AttrValue -Node $stDomain -Name 'datatype';  if (-not $dt) { $dt = 'string' }
+        $pass = Compare-Value -Actual $group.Domain -Expected $exp -Operation $op -Datatype $dt
+        if (-not $pass) { $allPass = $false }
+        $results += [pscustomobject]@{ Type='Group'; Field='domain'; Expected=$exp; Actual=$group.Domain; Pass=$pass; Evidence="op=$op, datatype=$dt" }
+    }
+
+    # -- member_count state
+    $stMemberCount = Select-XmlNode -Xml $stateNode -XPath "./*[local-name()='member_count']"
+    if ($stMemberCount) {
+        $exp = Get-InnerText $stMemberCount
+        $op  = Get-AttrValue -Node $stMemberCount -Name 'operation'; if (-not $op) { $op = 'equals' }
+        $dt  = Get-AttrValue -Node $stMemberCount -Name 'datatype';  if (-not $dt) { $dt = 'integer' }
+        $actualCount = ($members | Measure-Object).Count
+        $pass = Compare-Value -Actual $actualCount -Expected $exp -Operation $op -Datatype $dt
+        if (-not $pass) { $allPass = $false }
+        $results += [pscustomobject]@{ Type='Group'; Field='member_count'; Expected=$exp; Actual=$actualCount; Pass=$pass; Evidence="op=$op, datatype=$dt" }
+    }
+
+    # -- membership checks: user_sid / trustee_sid / user_name
+    foreach ($memField in @('user_sid','trustee_sid','user_name','trustee_name')) {
+        $stNode = Select-XmlNode -Xml $stateNode -XPath "./*[local-name()='$memField']"
+        if (-not $stNode) { continue }
+        $exp = Get-InnerText $stNode
+        $op  = Get-AttrValue -Node $stNode -Name 'operation';    if (-not $op) { $op = 'equals' }
+        $dt  = Get-AttrValue -Node $stNode -Name 'datatype';     if (-not $dt) { $dt = 'string' }
+        $ec  = Get-AttrValue -Node $stNode -Name 'entity_check'; if (-not $ec) { $ec = 'at least one' }
+        $expVar = Get-AttrValue -Node $stNode -Name 'var_ref'
+        $expVals = @($exp)
+        if ($expVar) { $tmp = Resolve-VarRef -VarRef $expVar; if ($tmp) { $expVals = $tmp } }
+
+        $actualVals = if ($memField -like '*sid') { $memberSIDs } else { $memberNames }
+        $pass = Evaluate-EntityCheck -ActualValues $actualVals -ExpectedValues $expVals -Operation $op -Datatype $dt -EntityCheck $ec
+        if (-not $pass) { $allPass = $false }
+        $results += [pscustomobject]@{
+            Type     = 'Group'
+            Field    = $memField
+            Expected = ($expVals -join ', ')
+            Actual   = ($actualVals -join ', ')
+            Pass     = $pass
+            Evidence = "entity_check=$ec, op=$op, datatype=$dt, members=$($members.Count)"
+        }
+    }
+
+    return [pscustomobject]@{
+        Type     = 'Group'
+        GroupName= $group.Name
+        GroupSID = $group.SID
+        Domain   = $group.Domain
+        Pass     = $allPass
+        Details  = $results
+        Evidence = "Members=$($members.Count); LocalAccount=$($group.LocalAccount)"
+    }
+}
+
+# ---  AccessToken test evaluator ----------------------------------------
 
 function Evaluate-AccessTokenTest {
     param([System.Xml.XmlNode]$test)
@@ -1407,22 +1583,51 @@ function Evaluate-AccessTokenTest {
     if (-not $obj) { return [pscustomobject]@{ Type='AccessToken'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="AccessToken object not found: $objectRefId" } }
     if (-not $stateNode) { return [pscustomobject]@{ Type='AccessToken'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="AccessToken state not found: $stateRefId" } }
 
-    $privNode = $stateNode.ChildNodes | Where-Object { $_.LocalName -like '*privilege' }
-    if ($privNode -is [System.Collections.IEnumerable] -and -not ($privNode -is [string])) { $privNode = $privNode | Select-Object -First 1 }
+    # Find any privilege or right node in the state
+    $privNode = $stateNode.ChildNodes | Where-Object {
+        $_.LocalName -match '^se.*(privilege|right)$'
+    }
+    if ($privNode -is [System.Collections.IEnumerable] -and -not ($privNode -is [string])) {
+        $privNode = $privNode | Select-Object -First 1
+    }
     if (-not $privNode) {
-        return [pscustomobject]@{ Type='AccessToken'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="No privilege node found in state" }
+        return [pscustomobject]@{
+            Type     = 'AccessToken'
+            Pass     = $false
+            Expected = 'N/A'
+            Actual   = 'N/A'
+            Evidence = "No privilege or right node found in state"
+        }
     }
-    $privilege = $privNode.LocalName
 
-    # Map privilege to expected SIDs
+    # Map OVAL field to Windows privilege name
+    $privField = $privNode.LocalName
     $privMap = @{
-        'seremoteshutdownprivilege' = @('S-1-5-32-544') # Administrators
-        'seauditprivilege' = @('S-1-5-19','S-1-5-20')   # Local Service, Network Service
-        # Add more as needed
+        'seinteractivelogonright'      = 'SeInteractiveLogonRight'
+        'seinteractivelogonprivilege'  = 'SeInteractiveLogonRight'
+        'sedenyinteractivelogonright'  = 'SeDenyInteractiveLogonRight'
+        'senetworklogonright'          = 'SeNetworkLogonRight'
+        'sedenynetworklogonright'      = 'SeDenyNetworkLogonRight'
+        'seremoteinteractivelogonright' = 'SeRemoteInteractiveLogonRight'
+        'sedenyremoteinteractivelogonright' = 'SeDenyRemoteInteractiveLogonRight'
+        # Add more mappings as needed
     }
-    $right = $privilege
-    $expectedSIDs = $privMap[$right]
-    if (-not $expectedSIDs) { $expectedSIDs = @('S-1-5-32-544') }
+    $privilege = $privMap[$privField]
+    if (-not $privilege) { $privilege = $privField }
+
+    # Get expected value (0 or 1)
+    $expected = $privNode.InnerText.Trim()
+    $expectedBool = $expected -eq '1'
+
+    # Get the security principal(s) being checked
+    $secPrin = $null
+    $secPrinNode = $obj.SelectSingleNode("./*[local-name()='security_principle']")
+    if ($secPrinNode) {
+        $secPrin = $secPrinNode.InnerText.Trim()
+    } else {
+        # Try set/union/filter logic (for group objects)
+        $secPrin = "(see object definition)"
+    }
 
     # Export user rights assignments
     $seceditFile = [System.IO.Path]::GetTempFileName()
@@ -1430,30 +1635,49 @@ function Evaluate-AccessTokenTest {
     $lines = Get-Content $seceditFile -ErrorAction SilentlyContinue
     Remove-Item $seceditFile -Force -ErrorAction SilentlyContinue
 
-    $line = $lines | Where-Object { $_ -match "^$right\s*=" }
+    $line = $lines | Where-Object { $_ -match "^$privilege\s*=" }
     $actual = if ($line) { ($line -split '=',2)[1].Trim() } else { '' }
-
-    # Parse actual SIDs (may be in the form *S-1-5-32-544,*S-1-5-19, etc.)
     $actualSIDs = @()
     if ($actual) {
         $actualSIDs = $actual -split ',' | ForEach-Object { $_.Trim().TrimStart('*') }
     }
 
-    # Compare: Pass if actual SIDs match expected SIDs (order-insensitive, exact match)
-    $pass = @($actualSIDs | Sort-Object) -eq @($expectedSIDs | Sort-Object)
+    # If the object is a group, try to resolve its SID or name for evidence
+    $objName = $null
+    $objSID = $null
+    $objNameNode = $obj.SelectSingleNode("./*[local-name()='security_principle']")
+    if ($objNameNode) { $objName = $objNameNode.InnerText.Trim() }
+    $objSIDNode = $obj.SelectSingleNode("./*[local-name()='sid']")
+    if ($objSIDNode) { $objSID = $objSIDNode.InnerText.Trim() }
+
+    # Determine if the principal is assigned the right
+    $isAssigned = $false
+    if ($objName) {
+        $isAssigned = $actualSIDs | Where-Object { $_ -eq $objName } | Measure-Object | Select-Object -ExpandProperty Count
+        $isAssigned = ($isAssigned -gt 0)
+    } elseif ($objSID) {
+        $isAssigned = $actualSIDs | Where-Object { $_ -eq $objSID } | Measure-Object | Select-Object -ExpandProperty Count
+        $isAssigned = ($isAssigned -gt 0)
+    } else {
+        # If no principal, just check if any are assigned
+        $isAssigned = ($actualSIDs.Count -gt 0)
+    }
+
+    # For OVAL, expectedBool=0 means the principal should NOT have the right
+    $pass = ($expectedBool -eq $isAssigned)
 
     return [pscustomobject]@{
-        Type     = 'AccessToken'
-        Privilege= $right
-        Expected = ($expectedSIDs -join ', ')
-        Actual   = ($actualSIDs -join ', ')
-        Pass     = $pass
-        Evidence = "Privilege $right assigned to: $($actualSIDs -join ', ') (expected $($expectedSIDs -join ', '))"
+        Type      = 'AccessToken'
+        Privilege = $privilege
+        Principal = $objName ?? $objSID ?? $secPrin
+        Expected  = $expected
+        Actual    = ($actualSIDs -join ', ')
+        Pass      = $pass
+        Evidence  = "Privilege $privilege assigned to: $($actualSIDs -join ', ') (expected $expected for $($objName ?? $objSID ?? $secPrin), OVAL field: $privField)"
     }
 }
 
-
-# --- New: FileEffectiveRights53 test evaluator ------------------------------
+# --- FileEffectiveRights53 test evaluator ------------------------------
 
 function Evaluate-FileEffectiveRights53Test {
     param([System.Xml.XmlNode]$test)
@@ -1568,10 +1792,15 @@ function Evaluate-Test {
         { $_ -eq 'lockout_policy_test' } { return Evaluate-LockoutPolicyTest -test $test }
         { $_ -like '*lockoutpolicy*_test' } { return Evaluate-LockoutPolicyTest -test $test }
         
-        # --- NEW: SID/SID, AccessToken, FileEffectiveRights53 ---
+        # --- SID/SID, AccessToken, FileEffectiveRights53 ---
         { $_ -eq 'sid_sid_test' } { return Evaluate-SidSidTest -test $test }
         { $_ -eq 'accesstoken_test' } { return Evaluate-AccessTokenTest -test $test }
         { $_ -eq 'fileeffectiverights53_test' } { return Evaluate-FileEffectiveRights53Test -test $test }
+
+        
+        # --- Group test ---
+        { $_ -eq 'group_test' } { return Evaluate-GroupTest -test $test }
+        #{ $_ -like '*group*_test' } { return Evaluate-GroupTest -test $test }  # 
 
 
         default {
@@ -1692,7 +1921,6 @@ function Evaluate-Criteria {
     }
 }
 
-#####################################################################################
 # === OVAL Registry Test Summary (optional, for visibility) ===
 
 Write-Host "`n=== OVAL Registry Test Summary ===" -ForegroundColor Cyan
