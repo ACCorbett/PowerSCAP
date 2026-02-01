@@ -386,7 +386,7 @@ Breaking changes between v1 and v2 are expected and intentional.
 - Domain and multi‑host scanning support
 - Remote scanning via PowerShell remoting (would cover the checks currently indeterminate over CIM)
 - Automated test suite
-- Optional PowerShell Gallery publishing
+- Linux Support
 
 No timelines are promised.
 
