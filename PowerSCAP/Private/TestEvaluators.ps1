@@ -520,18 +520,41 @@ function Evaluate-AccessTokenTest {
     # Map OVAL field to Windows privilege name
     $privField = $privNode.LocalName
     $privMap = @{
+        # Logon Rights
         'seinteractivelogonright'            = 'SeInteractiveLogonRight'
         'seinteractivelogonprivilege'        = 'SeInteractiveLogonRight'
-        'sedenyinteractivelogonright'        = 'SeDenyInteractiveLogonRight'
         'senetworklogonright'                = 'SeNetworkLogonRight'
-        'sedenynetworklogonright'            = 'SeDenyNetworkLogonRight'
+        'sebatchlogonright'                  = 'SeBatchLogonRight'
+        'seservicelogonright'                = 'SeServiceLogonRight'
         'seremoteinteractivelogonright'      = 'SeRemoteInteractiveLogonRight'
+        
+        # Deny Logon Rights
+        'sedenyinteractivelogonright'        = 'SeDenyInteractiveLogonRight'
+        'sedenynetworklogonright'            = 'SeDenyNetworkLogonRight'
+        'sedenybatchlogonright'              = 'SeDenyBatchLogonRight'
+        'sedenyservicelogonright'            = 'SeDenyServiceLogonRight'
         'sedenyremoteinteractivelogonright'  = 'SeDenyRemoteInteractiveLogonRight'
+        
+        # Privileges
         'seimpersonateprivilege'             = 'SeImpersonatePrivilege'
         'seprofilesingleprocessprivilege'    = 'SeProfileSingleProcessPrivilege'
+        'setcbprivilege'                     = 'SeTcbPrivilege'
+        'sebackupprivilege'                  = 'SeBackupPrivilege'
+        'serestoreprivilege'                 = 'SeRestorePrivilege'
+        'sedebugprivilege'                   = 'SeDebugPrivilege'
+        'seloadsriverprivilege'              = 'SeLoadDriverPrivilege'
+        'setakeownershipprivilege'           = 'SeTakeOwnershipPrivilege'
+        'semanagevolumeprivilege'            = 'SeManageVolumePrivilege'
+        'seenabedelegationprivilege'         = 'SeEnableDelegationPrivilege'
     }
-    $privilege = $privMap[$privField]
-    if (-not $privilege) { $privilege = $privField }
+    $privilege = $privMap[$privField.ToLowerInvariant()]
+    if (-not $privilege) { 
+        # If not in map, try to convert OVAL field to proper case
+        # Most follow pattern: se + name + right/privilege
+        $privilege = $privField -replace '^se', 'Se' -replace 'right$', 'Right' -replace 'privilege$', 'Privilege'
+        # Capitalize each word part (handle cases like "batchlogon" -> "BatchLogon")
+        $privilege = [regex]::Replace($privilege, '([a-z])([A-Z])', '$1$2')
+    }
 
     # Expected value (0 or 1)
     $expected = $privNode.InnerText.Trim()
@@ -560,27 +583,87 @@ function Evaluate-AccessTokenTest {
     $principal = $objName
     if (-not $principal) { $principal = $objSID }
 
+    # Resolve SIDs to friendly names for better display
+    $resolvedNames = @()
+    foreach ($sid in $actualSIDs) {
+        if ($sid) {
+            try {
+                # Try to resolve SID to account name
+                $account = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
+                $resolvedNames += "$account ($sid)"
+            } catch {
+                # If resolution fails, just use the SID/name as-is
+                $resolvedNames += $sid
+            }
+        }
+    }
+
     # Is the principal assigned the right?
+    # Check if objName is a regex pattern (contains regex special chars)
+    $isRegexPattern = ($objName -and ($objName -match '[\^$.*+?{}\[\]\\|()]'))
+    
     $isAssigned = $false
-    if ($objName) {
+    $matchedPrincipals = @()
+    
+    if ($isRegexPattern) {
+        # For regex patterns, check if any actual SID/name matches the pattern
+        foreach ($item in $actualSIDs) {
+            if ($item) {
+                # Try to resolve SID to name for pattern matching
+                $nameToMatch = $item
+                try {
+                    $nameToMatch = (New-Object System.Security.Principal.SecurityIdentifier($item)).Translate([System.Security.Principal.NTAccount]).Value
+                } catch {
+                    # Use as-is if resolution fails
+                }
+                
+                if ($nameToMatch -match $objName) {
+                    $isAssigned = $true
+                    $matchedPrincipals += $nameToMatch
+                }
+            }
+        }
+    } elseif ($objName) {
+        # Exact match for non-regex principals
         $isAssigned = (((@($actualSIDs | Where-Object { $_ -eq $objName }) | Measure-Object).Count) -gt 0)
+        if ($isAssigned) { $matchedPrincipals += $objName }
     } elseif ($objSID) {
+        # Match by SID
         $isAssigned = (((@($actualSIDs | Where-Object { $_ -eq $objSID }) | Measure-Object).Count) -gt 0)
+        if ($isAssigned) { $matchedPrincipals += $objSID }
     } else {
+        # No specific principal - just check if ANY principals have the right
         $isAssigned = (((@($actualSIDs) | Measure-Object).Count) -gt 0)
     }
 
     # For OVAL, expected 0 means the principal should NOT have the right
     $pass = ($expectedBool -eq $isAssigned)
+    
+    # Build evidence message
+    $evidenceMsg = "Privilege $privilege "
+    if ($resolvedNames.Count -gt 0) {
+        $evidenceMsg += "is assigned to: $($resolvedNames -join '; ')"
+    } else {
+        $evidenceMsg += "is not assigned to any users/groups"
+    }
+    if ($isRegexPattern) {
+        $evidenceMsg += " | Pattern: $objName"
+        if ($matchedPrincipals.Count -gt 0) {
+            $evidenceMsg += " | Matched: $($matchedPrincipals -join ', ')"
+        } else {
+            $evidenceMsg += " | No matches found"
+        }
+    }
+    $evidenceMsg += " | Expected: $expected (should " + $(if ($expectedBool) { "HAVE" } else { "NOT have" }) + " privilege)"
 
     return [pscustomobject]@{
         Type      = 'AccessToken'
         Privilege = $privilege
         Principal = $principal
         Expected  = $expected
-        Actual    = ($actualSIDs -join ', ')
+        Actual    = if ($resolvedNames.Count -gt 0) { $resolvedNames -join '; ' } else { '(none)' }
         Pass      = $pass
-        Evidence  = "Privilege $privilege assigned to: $($actualSIDs -join ', ') (expected $expected for $principal, OVAL field: $privField)"
+        Evidence  = $evidenceMsg
     }
 }
 

@@ -107,6 +107,63 @@ function Scan-Computer {
     }
     $oval = $ovalNodes[0]
 
+    # Locate XCCDF Benchmark for severity and other metadata
+    Write-Verbose "Looking for XCCDF Benchmark..."
+    $xccdfNodes = Select-XmlNodes -Xml $xml -XPath "/*[local-name()='data-stream-collection']/*[local-name()='component']/*[local-name()='Benchmark']"
+    Write-Verbose "Found $(@($xccdfNodes).Count) XCCDF nodes"
+    
+    if (-not $xccdfNodes -or ((@($xccdfNodes) | Measure-Object).Count) -eq 0) {
+        $xccdf = $null
+    } else {
+        $xccdf = @($xccdfNodes)[0]
+    }
+    
+    # Build XCCDF Rule lookup (maps OVAL def ID to severity and other metadata)
+    $script:xccdfRules = @{}
+    if ($xccdf -ne $null) {
+        Write-Verbose "Parsing XCCDF Benchmark for severity mappings..."
+        $ruleNodes = Select-XmlNodes -Xml $xccdf -XPath ".//*[local-name()='Rule']"
+        Write-Verbose "Found $(@($ruleNodes).Count) XCCDF Rule nodes"
+        
+        $mappingCount = 0
+        foreach ($rule in $ruleNodes) {
+            # Get severity attribute
+            $severityAttr = $rule.Attributes["severity"]
+            $severity = if ($severityAttr) { $severityAttr.Value } else { $null }
+            
+            # Get weight attribute
+            $weightAttr = $rule.Attributes["weight"]
+            $weight = if ($weightAttr) { $weightAttr.Value } else { $null }
+            
+            # Get rule ID for debugging
+            $ruleIdAttr = $rule.Attributes["id"]
+            $ruleId = if ($ruleIdAttr) { $ruleIdAttr.Value } else { "unknown" }
+            
+            # Find check-content-ref that points to OVAL definition
+            $checkRefs = Select-XmlNodes -Xml $rule -XPath ".//*[local-name()='check-content-ref']"
+            foreach ($checkRef in $checkRefs) {
+                $nameAttr = $checkRef.Attributes["name"]
+                if ($nameAttr) {
+                    $ovalDefId = $nameAttr.Value
+                    if (-not $script:xccdfRules.ContainsKey($ovalDefId)) {
+                        $script:xccdfRules[$ovalDefId] = @{
+                            Severity = $severity
+                            Weight   = $weight
+                            RuleId   = $ruleId
+                        }
+                        $mappingCount++
+                        if ($mappingCount -le 3) {
+                            Write-Verbose "  Mapped: $ovalDefId -> Severity: $severity (Rule: $ruleId)"
+                        }
+                    }
+                }
+            }
+        }
+        Write-Verbose "Created $mappingCount XCCDF->OVAL severity mappings"
+    } else {
+        Write-Warning "No XCCDF Benchmark found in SCAP file - severity information will not be available"
+    }
+
     # Build lookups
     $definitionNodes = Select-XmlNodes -Xml $oval -XPath "./*[local-name()='definitions']/*[local-name()='definition']"
     $script:definitions = @{}
@@ -164,7 +221,40 @@ function Scan-Computer {
         $defId = if ($defIdAttr) { $defIdAttr.Value } else { $null }
 
         $title = Get-InnerText (Select-XmlNode -Xml $def -XPath "./*[local-name()='metadata']/*[local-name()='title']")
-        $severity = Get-InnerText (Select-XmlNode -Xml $def -XPath "./*[local-name()='metadata']/*[local-name()='severity']")
+        
+        # Try to get severity from XCCDF first (more accurate), fallback to OVAL metadata
+        $severity = $null
+        if ($defId -and $script:xccdfRules.ContainsKey($defId)) {
+            $severity = $script:xccdfRules[$defId].Severity
+            if ($evalCount -le 3) {
+                Write-Verbose "  DefID: $defId -> Severity from XCCDF: $severity"
+            }
+        }
+        # Fallback: match by numeric suffix (handles oval:mil.disa.stig.defs:def:NNNN
+        # -> oval:mil.disa.stig.windows11:def:NNNN namespace mismatch)
+        if (-not $severity -and $defId) {
+            $numMatch = [System.Text.RegularExpressions.Regex]::Match($defId, ':(\d+)$')
+            if ($numMatch.Success) {
+                $numSuffix = $numMatch.Groups[1].Value
+                foreach ($key in $script:xccdfRules.Keys) {
+                    if ($key.EndsWith(":$numSuffix")) {
+                        $severity = $script:xccdfRules[$key].Severity
+                        break
+                    }
+                }
+            }
+        }
+        if (-not $severity) {
+            # Fallback to OVAL metadata (less reliable)
+            $severity = Get-InnerText (Select-XmlNode -Xml $def -XPath "./*[local-name()='metadata']/*[local-name()='severity']")
+            if ($evalCount -le 3 -and $severity) {
+                Write-Verbose "  DefID: $defId -> Severity from OVAL: $severity"
+            }
+            if ($evalCount -le 3 -and -not $severity) {
+                Write-Verbose "  DefID: $defId -> No severity found"
+            }
+        }
+        
         $criteria = Select-XmlNode -Xml $def -XPath "./*[local-name()='criteria']"
 
         $eval = Evaluate-Criteria -criteriaNode $criteria -DefinitionId $defId
@@ -248,7 +338,7 @@ function Scan-Computer {
 
         Write-Host "`n=== SCAP Compliance Summary ===" -ForegroundColor Cyan
         $results |
-          Select-Object RuleId, @{n='Status'; e={ if ($_.Pass) { 'PASS' } else { 'FAIL' } }}, RuleTitle |
+          Select-Object RuleId, @{n='Status'; e={ if ($_.Pass) { 'PASS' } else { 'FAIL' } }}, Severity, RuleTitle |
           Format-Table -AutoSize
 
         Write-Host "`n=== Detailed Failure Information ===" -ForegroundColor Yellow
@@ -256,7 +346,13 @@ function Scan-Computer {
             Write-Host "`nRule: $($result.RuleId)" -ForegroundColor Red
             Write-Host "Title: $($result.RuleTitle)" -ForegroundColor Blue
             if ($result.Severity) {
-                Write-Host "Severity: $($result.Severity)" -ForegroundColor Red
+                $severityColor = switch ($result.Severity.ToLower()) {
+                    'high'   { 'Red' }
+                    'medium' { 'Yellow' }
+                    'low'    { 'Green' }
+                    default  { 'White' }
+                }
+                Write-Host "Severity: $($result.Severity.ToUpper())" -ForegroundColor $severityColor
             }
             if ($result.Evidence) { Print-EvidenceRecursive -Evidence $result.Evidence }
             else { Write-Host "  No detailed evidence available" -ForegroundColor DarkGray }
@@ -274,7 +370,7 @@ function Scan-Computer {
     } else {
         Write-Host "`n=== SCAP Compliance Summary ===" -ForegroundColor Cyan
         $results |
-          Select-Object RuleId, @{n='Status'; e={ if ($_.Pass) { 'PASS' } else { 'FAIL' } }} |
+          Select-Object RuleId, @{n='Status'; e={ if ($_.Pass) { 'PASS' } else { 'FAIL' } }}, Severity |
           Format-Table -AutoSize
 
         Write-Host "`nCompleted: $evalCount/$definitionTotal definitions" -ForegroundColor White
