@@ -12,6 +12,22 @@ function Evaluate-LockoutPolicyTest {
         return [pscustomobject]@{ Type='LockoutPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Lockout policy state not found: $($refs.stateRefId)" }
     }
 
+    # secedit.exe is local-only; cannot evaluate remotely
+    if ($script:CimSession) {
+        return [pscustomobject]@{
+            Type    = 'LockoutPolicy'
+            Pass    = $false
+            Details = @([pscustomobject]@{
+                Type     = 'LockoutPolicy'
+                Field    = '(all)'
+                Expected = 'N/A'
+                Actual   = '(indeterminate - remote secedit.exe not supported)'
+                Pass     = $false
+                Evidence = "Lockout policy checks require local execution or PowerShell remoting. secedit.exe cannot be invoked via CIM."
+            })
+        }
+    }
+
     # Map OVAL state fields to secedit keys
     $fieldMap = @{
         'lockout_threshold'   = 'LockoutBadCount'     # Number of invalid logon attempts
@@ -137,11 +153,33 @@ function Evaluate-RegistryTest {
     if (-not $stateNode) {
         $checkExistence = Get-AttrValue -Node $test -Name 'check_existence'
         $val = $null
-        if ($name) { $val = Get-RegistryItemProperty -Hive $hive -Key $key -Name $name }
-        else {
-            $mappedHive = $hive -replace '^HKEY_LOCAL_MACHINE$', 'HKLM:' -replace '^HKEY_CURRENT_USER$', 'HKCU:' -replace '^HKEY_USERS$', 'HKU:' -replace '^HKEY_CLASSES_ROOT$', 'HKCR:'
-            $regPath = "$mappedHive\$key"
-            try { $val = if (Test-Path -LiteralPath $regPath) { 'key_exists' } else { $null } } catch { $val = $null }
+        if ($name) {
+            $val = Get-RegistryItemProperty -Hive $hive -Key $key -Name $name
+        } else {
+            # Key-existence check
+            if ($script:CimSession) {
+                # Remote: use StdRegProv EnumKey to test key existence
+                $hiveConst = @{
+                    'HKEY_LOCAL_MACHINE' = 2147483650
+                    'HKEY_CURRENT_USER'  = 2147483649
+                    'HKEY_USERS'         = 2147483652
+                    'HKEY_CLASSES_ROOT'  = 2147483648
+                }
+                $hKey = if ($hiveConst.ContainsKey($hive)) { $hiveConst[$hive] } else { $null }
+                if ($hKey) {
+                    try {
+                        $regProv = Get-CimInstance -ClassName StdRegProv -Namespace root\default -CimSession $script:CimSession -ErrorAction Stop
+                        $enumResult = Invoke-CimMethod -InputObject $regProv -MethodName 'EnumKey' -Arguments @{ hKey = $hKey; sKeyName = $key } -ErrorAction Stop
+                        # ReturnValue 0 = success (key exists); anything else = key not found
+                        $val = if ($enumResult -and $enumResult.ReturnValue -eq 0) { 'key_exists' } else { $null }
+                    } catch { $val = $null }
+                }
+            } else {
+                # Local: direct path test
+                $mappedHive = $hive -replace '^HKEY_LOCAL_MACHINE$', 'HKLM:' -replace '^HKEY_CURRENT_USER$', 'HKCU:' -replace '^HKEY_USERS$', 'HKU:' -replace '^HKEY_CLASSES_ROOT$', 'HKCR:'
+                $regPath = "$mappedHive\$key"
+                try { $val = if (Test-Path -LiteralPath $regPath) { 'key_exists' } else { $null } } catch { $val = $null }
+            }
         }
         $exists = ($null -ne $val)
         $pass = $false
@@ -238,30 +276,51 @@ function Evaluate-FileTest {
     $existsOp = Get-AttrValue -Node $existsNode -Name 'operation'; if (-not $existsOp) { $existsOp = 'equals' }
 
     $existsActual = $false
-    try { $existsActual = Test-Path -LiteralPath $fullPath } catch { $existsActual = $false }
+    $versionActual = $null
+    $sizeActual = $null
+
+    if ($script:CimSession) {
+        # Remote: use Win32_File via CimSession
+        try {
+            $escapedPath = $fullPath -replace '\\', '\\\\'
+            $cimFile = Get-CimInstance -ClassName Win32_File -Filter "Name='$escapedPath'" -CimSession $script:CimSession -ErrorAction SilentlyContinue
+            if ($cimFile) {
+                $existsActual = $true
+                $sizeActual = $cimFile.Size
+                $versionActual = $cimFile.Version
+            }
+        } catch { $existsActual = $false }
+    } else {
+        # Local: direct filesystem access
+        try { $existsActual = Test-Path -LiteralPath $fullPath } catch { $existsActual = $false }
+        if ($existsActual) {
+            try {
+                $fi = Get-Item -LiteralPath $fullPath -ErrorAction Stop
+                $sizeActual = $fi.Length
+                $versionActual = $fi.VersionInfo.FileVersion
+            } catch { }
+        }
+    }
+
     $existsPass = $true
     if ($existsNode) {
         $existsPass = Compare-Value -Actual $existsActual -Expected $existsExpected -Operation $existsOp -Datatype 'boolean'
     }
 
-    $versionPass = $true; $versionActual = $null; $versionExpected = Get-InnerText $versionNode
-    if ($versionNode -and $existsActual) {
-        try {
-            $fi = Get-Item -LiteralPath $fullPath -ErrorAction Stop
-            $versionActual = $fi.VersionInfo.FileVersion
-            $versionOp = Get-AttrValue -Node $versionNode -Name 'operation'; if (-not $versionOp) { $versionOp = 'equals' }
-            $versionPass = Compare-Value -Actual $versionActual -Expected $versionExpected -Operation $versionOp -Datatype 'version'
-        } catch { $versionPass = $false }
+    $versionPass = $true; $versionExpected = Get-InnerText $versionNode
+    if ($versionNode -and $existsActual -and $null -ne $versionActual) {
+        $versionOp = Get-AttrValue -Node $versionNode -Name 'operation'; if (-not $versionOp) { $versionOp = 'equals' }
+        $versionPass = Compare-Value -Actual $versionActual -Expected $versionExpected -Operation $versionOp -Datatype 'version'
+    } elseif ($versionNode -and -not $existsActual) {
+        $versionPass = $false
     }
 
-    $sizePass = $true; $sizeActual = $null; $sizeExpected = Get-InnerText $sizeNode
-    if ($sizeNode -and $existsActual) {
-        try {
-            $fi = Get-Item -LiteralPath $fullPath -ErrorAction Stop
-            $sizeActual = $fi.Length
-            $sizeOp = Get-AttrValue -Node $sizeNode -Name 'operation'; if (-not $sizeOp) { $sizeOp = 'equals' }
-            $sizePass = Compare-Value -Actual $sizeActual -Expected $sizeExpected -Operation $sizeOp -Datatype 'integer'
-        } catch { $sizePass = $false }
+    $sizePass = $true; $sizeExpected = Get-InnerText $sizeNode
+    if ($sizeNode -and $existsActual -and $null -ne $sizeActual) {
+        $sizeOp = Get-AttrValue -Node $sizeNode -Name 'operation'; if (-not $sizeOp) { $sizeOp = 'equals' }
+        $sizePass = Compare-Value -Actual $sizeActual -Expected $sizeExpected -Operation $sizeOp -Datatype 'integer'
+    } elseif ($sizeNode -and -not $existsActual) {
+        $sizePass = $false
     }
 
     $overallPass = ($existsPass -and $versionPass -and $sizePass)
@@ -303,16 +362,24 @@ function Evaluate-ServiceTest {
     $actualStatus = $null
 
     try {
-        $svc = Get-Service -Name $svcName -ErrorAction Stop
-        $existsPass = $true
-        $actualStatus = $svc.Status.ToString()
-        if ($expectedStartType) {
-            $svcInfo = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue
-            $actualStartType = if ($svcInfo) { $svcInfo.StartMode } else { $null }
-            $startTypePass = Compare-Value -Actual $actualStartType -Expected $expectedStartType -Operation 'equals' -Datatype 'string'
-        }
-        if ($expectedStatus) {
-            $statusPass = Compare-Value -Actual $actualStatus -Expected $expectedStatus -Operation 'equals' -Datatype 'string'
+        # Use CIM (supports remote via $script:CimSession) for both existence and properties
+        $cimArgs = @{ ClassName = 'Win32_Service'; Filter = "Name='$svcName'"; ErrorAction = 'Stop' }
+        if ($script:CimSession) { $cimArgs['CimSession'] = $script:CimSession }
+        $svcInfo = Get-CimInstance @cimArgs
+
+        if ($svcInfo) {
+            $existsPass = $true
+            $actualStatus  = $svcInfo.State.ToString()
+            $actualStartType = $svcInfo.StartMode
+
+            if ($expectedStartType) {
+                $startTypePass = Compare-Value -Actual $actualStartType -Expected $expectedStartType -Operation 'equals' -Datatype 'string'
+            }
+            if ($expectedStatus) {
+                $statusPass = Compare-Value -Actual $actualStatus -Expected $expectedStatus -Operation 'equals' -Datatype 'string'
+            }
+        } else {
+            $existsPass = $false; $startTypePass = $false; $statusPass = $false
         }
     } catch {
         $existsPass = $false
@@ -360,9 +427,14 @@ function Evaluate-ProcessTest {
 
     $procs = @()
     try {
-        $procs = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='$name'" -ErrorAction SilentlyContinue)
+        $cimArgs = @{ ClassName = 'Win32_Process'; Filter = "Name='$name'"; ErrorAction = 'SilentlyContinue' }
+        if ($script:CimSession) { $cimArgs['CimSession'] = $script:CimSession }
+        $procs = @(Get-CimInstance @cimArgs)
         if ((Get-SafeCount $procs) -eq 0) {
-            $procs = @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $name -or ($_.ExecutablePath -and $_.ExecutablePath -like "*\$name") })
+            # Fallback: broad scan filtered client-side (expensive but covers edge cases)
+            $cimArgsBroad = @{ ClassName = 'Win32_Process'; ErrorAction = 'SilentlyContinue' }
+            if ($script:CimSession) { $cimArgsBroad['CimSession'] = $script:CimSession }
+            $procs = @(Get-CimInstance @cimArgsBroad | Where-Object { $_.Name -eq $name -or ($_.ExecutablePath -and $_.ExecutablePath -like "*\$name") })
         }
     } catch { $procs = @() }
     $procCount = (Get-SafeCount $procs)
@@ -561,6 +633,19 @@ function Evaluate-AccessTokenTest {
     $expectedBool = ($expected -eq '1')
 
     # Export user rights assignments
+    if ($script:CimSession) {
+        # secedit.exe is local-only; cannot evaluate remotely via CIM
+        return [pscustomobject]@{
+            Type      = 'AccessToken'
+            Privilege = $privilege
+            Principal = $principal
+            Expected  = $expected
+            Actual    = '(indeterminate - remote secedit.exe not supported)'
+            Pass      = $false
+            Evidence  = "AccessToken/privilege checks require local execution or PowerShell remoting. secedit.exe cannot be invoked via CIM."
+        }
+    }
+
     $seceditFile = [System.IO.Path]::GetTempFileName()
     secedit.exe /export /cfg $seceditFile 2>$null | Out-Null
     $lines = Get-Content $seceditFile -ErrorAction SilentlyContinue
@@ -701,36 +786,61 @@ function Evaluate-FileEffectiveRights53Test {
 
     # Get effective rights for the trustee
     $actual = 'false'
-    try {
-        $acl = Get-Acl -Path $path -ErrorAction Stop
-        $access = @($acl.Access | Where-Object { $_.IdentityReference -like "*$trustee" })
-        if ((Get-SafeCount $access) -gt 0) {
-            # Map rightName to FileSystemRights
-            $rightMap = @{
-                'standard_delete'            = 'Delete'
-                'standard_read_control'      = 'ReadPermissions'
-                'standard_write_dac'         = 'ChangePermissions'
-                'standard_write_owner'       = 'TakeOwnership'
-                'standard_synchronize'       = 'Synchronize'
-                'generic_read'               = 'Read'
-                'generic_write'              = 'Write'
-                'generic_execute'            = 'ExecuteFile'
-                'file_read_data'             = 'ReadData'
-                'file_write_data'            = 'WriteData'
-                'file_append_data'           = 'AppendData'
-                'file_read_ea'               = 'ReadExtendedAttributes'
-                'file_write_ea'              = 'WriteExtendedAttributes'
-                'file_execute'               = 'ExecuteFile'
-                'file_delete_child'          = 'DeleteSubdirectoriesAndFiles'
-                'file_read_attributes'       = 'ReadAttributes'
-                'file_write_attributes'      = 'WriteAttributes'
+    if ($script:CimSession) {
+        # Remote: use Win32_LogicalFileIdentity or fall back to Win32_File existence only
+        # Full ACL enumeration is not available via standard CIM; report as indeterminate
+        try {
+            $escapedPath = $path -replace '\\', '\\\\'
+            $cimFile = Get-CimInstance -ClassName Win32_File -Filter "Name='$escapedPath'" -CimSession $script:CimSession -ErrorAction SilentlyContinue
+            if ($cimFile) {
+                # Cannot reliably determine fine-grained ACL entries remotely via CIM alone.
+                # Return indeterminate so the result is flagged rather than silently wrong.
+                return [pscustomobject]@{
+                    Type     = 'FileEffectiveRights53'
+                    Path     = $path
+                    Trustee  = $trustee
+                    Right    = $rightName
+                    Expected = $expected
+                    Actual   = '(indeterminate - remote ACL check not supported via CIM)'
+                    Pass     = $false
+                    Evidence = "Remote ACL evaluation requires local execution or PowerShell remoting. File exists on remote target."
+                }
+            } else {
+                $actual = 'false'
             }
-            $fsRight = $rightMap[$rightName]
-            if (-not $fsRight) { $fsRight = $rightName }
-            $hasRightEntries = @($access | Where-Object { $_.FileSystemRights.ToString() -match [regex]::Escape($fsRight) })
-            $actual = if ((Get-SafeCount $hasRightEntries) -gt 0) { 'true' } else { 'false' }
-        }
-    } catch { $actual = 'false' }
+        } catch { $actual = 'false' }
+    } else {
+        # Local: direct ACL access
+        try {
+            $acl = Get-Acl -Path $path -ErrorAction Stop
+            $access = @($acl.Access | Where-Object { $_.IdentityReference -like "*$trustee" })
+            if ((Get-SafeCount $access) -gt 0) {
+                $rightMap = @{
+                    'standard_delete'            = 'Delete'
+                    'standard_read_control'      = 'ReadPermissions'
+                    'standard_write_dac'         = 'ChangePermissions'
+                    'standard_write_owner'       = 'TakeOwnership'
+                    'standard_synchronize'       = 'Synchronize'
+                    'generic_read'               = 'Read'
+                    'generic_write'              = 'Write'
+                    'generic_execute'            = 'ExecuteFile'
+                    'file_read_data'             = 'ReadData'
+                    'file_write_data'            = 'WriteData'
+                    'file_append_data'           = 'AppendData'
+                    'file_read_ea'               = 'ReadExtendedAttributes'
+                    'file_write_ea'              = 'WriteExtendedAttributes'
+                    'file_execute'               = 'ExecuteFile'
+                    'file_delete_child'          = 'DeleteSubdirectoriesAndFiles'
+                    'file_read_attributes'       = 'ReadAttributes'
+                    'file_write_attributes'      = 'WriteAttributes'
+                }
+                $fsRight = $rightMap[$rightName]
+                if (-not $fsRight) { $fsRight = $rightName }
+                $hasRightEntries = @($access | Where-Object { $_.FileSystemRights.ToString() -match [regex]::Escape($fsRight) })
+                $actual = if ((Get-SafeCount $hasRightEntries) -gt 0) { 'true' } else { 'false' }
+            }
+        } catch { $actual = 'false' }
+    }
 
     $pass = Compare-Value -Actual $actual -Expected $expected -Operation $operation -Datatype 'boolean'
     return [pscustomobject]@{
@@ -759,6 +869,22 @@ function Evaluate-AuditEventPolicySubcategoriesTest {
 
     if (-not $obj) { return [pscustomobject]@{ Type='AuditPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Audit policy object not found: $objectRefId" } }
     if (-not $stateNode) { return [pscustomobject]@{ Type='AuditPolicy'; Pass=$false; Expected='N/A'; Actual='N/A'; Evidence="Audit policy state not found: $stateRefId" } }
+
+    # auditpol.exe is local-only; cannot evaluate remotely
+    if ($script:CimSession) {
+        return [pscustomobject]@{
+            Type     = 'AuditPolicy'
+            Pass     = $false
+            Details  = @([pscustomobject]@{
+                Type     = 'AuditPolicy'
+                Subcategory = '(all)'
+                Expected = 'N/A'
+                Actual   = '(indeterminate - remote auditpol.exe not supported)'
+                Pass     = $false
+                Evidence = "Audit policy checks require local execution or PowerShell remoting. auditpol.exe cannot be invoked via CIM."
+            })
+        }
+    }
 
     $subcategoryMap = @{
         'sensitive_privilege_use'     = 'Sensitive Privilege Use'
@@ -856,16 +982,19 @@ function Evaluate-GroupTest {
         if ($vals -and (Get-SafeCount $vals) -gt 0) { $groupSid = $vals[0] }
     }
 
-    # Locate the group via CIM
+    # Locate the group via CIM (remote-aware)
     $group = $null
     try {
+        $cimArgs = @{ ClassName = 'Win32_Group'; ErrorAction = 'SilentlyContinue' }
+        if ($script:CimSession) { $cimArgs['CimSession'] = $script:CimSession }
+
         if ($groupSid) {
-            $group = Get-CimInstance -ClassName Win32_Group -Filter "SID='$groupSid'" -ErrorAction SilentlyContinue
+            $group = Get-CimInstance @cimArgs -Filter "SID='$groupSid'"
         }
         if (-not $group -and $groupName) {
-            $group = Get-CimInstance -ClassName Win32_Group -Filter "Name='$groupName'" -ErrorAction SilentlyContinue
+            $group = Get-CimInstance @cimArgs -Filter "Name='$groupName'"
             if (-not $group) {
-                $group = Get-CimInstance -ClassName Win32_Group -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $groupName } | Select-Object -First 1
+                $group = Get-CimInstance @cimArgs | Where-Object { $_.Name -eq $groupName } | Select-Object -First 1
             }
         }
     } catch { }

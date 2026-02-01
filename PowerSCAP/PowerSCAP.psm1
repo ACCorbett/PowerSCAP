@@ -17,10 +17,13 @@ $script:CimSession            = $null
 . "$PSScriptRoot\Private\TestEvaluators.ps1"
 . "$PSScriptRoot\Private\Criteria.ps1"
 . "$PSScriptRoot\Private\Output.ps1"
+. "$PSScriptRoot\Private\SqlHelpers.ps1"
 
 # --- Public commands ---
 . "$PSScriptRoot\Public\Scan-Computer.ps1"
 . "$PSScriptRoot\Public\Scan-Domain.ps1"
 . "$PSScriptRoot\Public\Scan-Database.ps1"
+. "$PSScriptRoot\Public\Scan-SQLInstance.ps1"
+. "$PSScriptRoot\Public\Scan-SQLDatabase.ps1"
 
-Export-ModuleMember -Function Scan-Computer, Scan-Domain, Scan-Database
+Export-ModuleMember -Function Scan-Computer, Scan-Domain, Scan-Database, Scan-SQLInstance, Scan-SQLDatabase

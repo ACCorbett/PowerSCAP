@@ -1,9 +1,32 @@
 # === Local Accounts ===
-# Auto-generated from original script on 2026-01-30 14:48:45
 
 function Get-LocalGroupMembers {
     param([Parameter(Mandatory=$true)][string]$GroupName)
 
+    # --- Remote path: enumerate via CIM Win32_Group association ---
+    if ($script:CimSession) {
+        try {
+            $cimArgs = @{ ClassName = 'Win32_Group'; Filter = "Name='$GroupName'"; CimSession = $script:CimSession; ErrorAction = 'Stop' }
+            $grp = Get-CimInstance @cimArgs
+            if (-not $grp) { return @() }
+
+            # Use Get-CimAssociatedInstance to get Win32_UserAccount / Win32_Group members
+            $members = @(Get-CimAssociatedInstance -InputObject $grp -ResultClassName 'Win32_UserAccount' -CimSession $script:CimSession -ErrorAction SilentlyContinue)
+            $members += @(Get-CimAssociatedInstance -InputObject $grp -ResultClassName 'Win32_Group' -CimSession $script:CimSession -ErrorAction SilentlyContinue)
+
+            return $members | ForEach-Object {
+                [pscustomobject]@{
+                    Name            = $_.Name
+                    SID             = $_.SID
+                    PrincipalSource = if ($_.Domain) { $_.Domain } else { 'Unknown' }
+                }
+            }
+        } catch {
+            return @()
+        }
+    }
+
+    # --- Local path ---
     # Prefer built-in cmdlet (PS 5.1+, Windows 10+/Server 2016+)
     if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
         try {
@@ -66,13 +89,13 @@ function Get-LocalAccountNameBySid {
         }
     } catch { }
 
-    # Try CIM
+    # Try CIM (remote-aware)
     try {
-        $cim = Get-CimInstance -ClassName Win32_UserAccount | Where-Object { $_.SID -eq $sid }
+        $cimArgs = @{ ClassName = 'Win32_UserAccount'; ErrorAction = 'SilentlyContinue' }
+        if ($script:CimSession) { $cimArgs['CimSession'] = $script:CimSession }
+        $cim = Get-CimInstance @cimArgs | Where-Object { $_.SID -eq $sid }
         if ($cim) { return $cim.Name }
     } catch { }
 
     return $null
 }
-
-
