@@ -98,8 +98,8 @@ function Compare-Value {
         }
         'case insensitive equals'        { return ([string]$Actual).ToLowerInvariant() -eq ([string]$Expected).ToLowerInvariant() }
         'case insensitive not equal'     { return ([string]$Actual).ToLowerInvariant() -ne ([string]$Expected).ToLowerInvariant() }
-        'pattern match'                  { if ($CaseSensitive) { return $Actual -match $Expected } else { return $Actual -imatch $Expected } }
-        'case insensitive pattern match' { return $Actual -imatch $Expected }
+        'pattern match'                  { try { if ($CaseSensitive) { return $Actual -match $Expected } else { return $Actual -imatch $Expected } } catch { Write-Warning "Invalid regex pattern: '$Expected'. Error: $($_.Exception.Message)"; return $false } }
+        'case insensitive pattern match' { try { return $Actual -imatch $Expected } catch { Write-Warning "Invalid regex pattern: '$Expected'. Error: $($_.Exception.Message)"; return $false } }
 
         # Numeric
         'greater than'            { return $Actual -gt $Expected }

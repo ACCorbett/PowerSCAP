@@ -6,6 +6,13 @@ function Get-RegistryItemProperty {
         [string]$Key,
         [string]$Name
     )
+    
+    # Check if running on Linux - registry operations not supported
+    $isLinux = ($PSVersionTable.Platform -eq 'Unix' -or $PSVersionTable.OS -like '*Linux*' -or $IsLinux)
+    if ($isLinux) {
+        Write-Verbose "Registry operations not supported on Linux"
+        return $null
+    }
 
     # --- Remote path: use StdRegProv via CimSession ---
     if ($script:CimSession) {
@@ -83,6 +90,14 @@ function Invoke-WmiQuery {
         [int]$MaxRows = 1000,
         [bool]$UseCim = $true
     )
+    
+    # Check if running on Linux - WMI operations not supported
+    $isLinux = ($PSVersionTable.Platform -eq 'Unix' -or $PSVersionTable.OS -like '*Linux*' -or $IsLinux)
+    if ($isLinux) {
+        Write-Verbose "WMI operations not supported on Linux"
+        return @()
+    }
+    
     if ([string]::IsNullOrWhiteSpace($Namespace) -or [string]::IsNullOrWhiteSpace($Query)) {
         return @()
     }

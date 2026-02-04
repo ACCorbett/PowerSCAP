@@ -4,14 +4,14 @@ function Scan-SQLDatabase {
   Scan a SQL Server database for STIG compliance using an XCCDF benchmark.
 
 .DESCRIPTION
-  Parses an XCCDF STIG benchmark (e.g., MS SQL Server 2016 Database STIG),
+  PowerSCAP v2.6.0 - Parses an XCCDF STIG benchmark (e.g., MS SQL Server 2016 Database STIG),
   extracts T-SQL checks from each rule's check-content, executes them against
   the target database on the specified SQL Server, and evaluates results
   against documented pass/fail criteria. Outputs match the schema of
   Scan-Computer for consistency.
 
   Connection can be established via an explicit -ConnectionString, or by
-  specifying -ComputerName and -Database (with optional -Credential). When
+  specifying -Computer and -Database (with optional -Credential). When
   no connection parameters are given, connects to the default local instance
   and the specified database.
 
@@ -20,22 +20,39 @@ function Scan-SQLDatabase {
   sys.databases or sys.server_principals) are automatically routed through
   the master database context when needed.
 
-.PARAMETER ScapFile
-  Path to the XCCDF XML benchmark file (e.g., U_MS_SQL_Server_2016_Database_STIG_*.xml).
+.PARAMETER ScanSourceType
+  How to obtain scan definitions (REQUIRED):
+  - File: Single XCCDF STIG file
 
-.PARAMETER OutputJson
-  When specified, emits results as JSON to stdout.
+.PARAMETER ScanSource
+  Source for scan definitions (REQUIRED):
+  - For File: Path to XCCDF file (e.g., "U_MS_SQL_Server_2016_Database_STIG_*.xml")
+
+.PARAMETER Computer
+  Target SQL Server hostname or IP. Defaults to localhost when omitted.
+  Can include an instance name (e.g., "SERVER01\SQLEXPRESS").
+
+.PARAMETER Output
+  Output format:
+  - Console: Formatted console output with color coding (default)
+  - JSON: JSON format
+  - CSV: Comma-separated values
+  - TSV: Tab-separated values
+  - Legacy: Original PowerSCAP console output
 
 .PARAMETER IncludePerTestDetails
   Include per-query evidence and row data in the output (default: $true).
 
-.PARAMETER ComputerName
-  Target SQL Server hostname or IP. Defaults to localhost when omitted.
-  Can include an instance name (e.g., "SERVER01\SQLEXPRESS").
-
 .PARAMETER Credential
   PSCredential for SQL Server authentication. When omitted, Windows (integrated)
   authentication is used.
+
+.PARAMETER InstallPowerSCAP
+  Controls PowerSCAP installation for remote scanning:
+  - No (default): Direct connection (no installation)
+  - Yes: Installs if needed, then runs locally (faster for multiple scans)
+  - Upgrade: Always installs/upgrades, then runs locally
+  - WhileScanning: Temporarily installs, scans, then removes
 
 .PARAMETER Database
   Name of the target database to scan. Required unless -ConnectionString already
@@ -43,39 +60,58 @@ function Scan-SQLDatabase {
   instance-level context.
 
 .PARAMETER ConnectionString
-  Full ADO.NET connection string. When provided, ComputerName, Credential, and
+  Full ADO.NET connection string. When provided, Computer, Credential, and
   Database parameters are ignored (except Database is appended if not already present).
 
 .EXAMPLE
   # Scan a specific database on the local instance
-  Scan-SQLDatabase -ScapFile ".\Database_STIG.xml" -Database "MyAppDB"
+  Scan-SQLDatabase -ScanSourceType File -ScanSource ".\Database_STIG.xml" -Database "MyAppDB"
 
 .EXAMPLE
   # Scan a remote database with SQL auth, JSON output
   $cred = Get-Credential "dbadmin"
-  Scan-SQLDatabase -ScapFile ".\Database_STIG.xml" -ComputerName "DBSERVER01" -Database "Production" -Credential $cred -OutputJson
+  Scan-SQLDatabase -ScanSourceType File -ScanSource ".\Database_STIG.xml" -Computer "DBSERVER01" -Database "Production" -Credential $cred -Output JSON
 
 .EXAMPLE
   # Scan with an explicit connection string
-  Scan-SQLDatabase -ScapFile ".\Database_STIG.xml" -ConnectionString "Server=DBSERVER01;Database=MyDB;Integrated Security=true;" 
+  Scan-SQLDatabase -ScanSourceType File -ScanSource ".\Database_STIG.xml" -ConnectionString "Server=DBSERVER01;Database=MyDB;Integrated Security=true;" 
+
+.NOTES
+  PowerSCAP v2.6.0 - Aligned parameters with Scan-Computer for consistency
 #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory=$true)]
-        [string]$ScapFile,
+        # Scan Configuration - Aligned with Scan-Computer
+        [Parameter(Mandatory)]
+        [ValidateSet('File')]
+        [string]$ScanSourceType = 'File',
 
+        [Parameter(Mandatory)]
+        [string]$ScanSource,
+        
+        # Target System - Aligned with Scan-Computer
         [Parameter()]
-        [bool]$OutputJson = $false,
+        [Alias('ComputerName')]
+        [string]$Computer,
 
+        # Output Configuration - Aligned with Scan-Computer
+        [Parameter()]
+        [ValidateSet('Console', 'JSON', 'CSV', 'TSV', 'Legacy')]
+        [string]$Output = 'Console',
+        
+        # Execution Parameters - Aligned with Scan-Computer
         [Parameter()]
         [bool]$IncludePerTestDetails = $true,
-
-        [Parameter()]
-        [string]$ComputerName,
-
+        
+        # Remote Scanning Parameters - Aligned with Scan-Computer
         [Parameter()]
         [System.Management.Automation.PSCredential]$Credential,
-
+        
+        [Parameter()]
+        [ValidateSet('Yes', 'Upgrade', 'WhileScanning', 'No')]
+        [string]$InstallPowerSCAP = 'No',
+        
+        # SQL-Specific Parameters
         [Parameter()]
         [string]$Database,
 
@@ -85,6 +121,13 @@ function Scan-SQLDatabase {
 
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
+    
+    # Map ScanSource to internal ScapFile parameter
+    $ScapFile = $ScanSource
+    
+    # Map Output to internal flags
+    $OutputJson = ($Output -eq 'JSON')
+    $outputNeedsConversion = ($Output -in @('CSV', 'TSV'))
 
     # --- Validate that we have a database target ---
     if ([string]::IsNullOrWhiteSpace($ConnectionString)) {
@@ -128,8 +171,8 @@ function Scan-SQLDatabase {
     $serverLabel = if (-not [string]::IsNullOrWhiteSpace($ConnectionString)) {
         $m = [System.Text.RegularExpressions.Regex]::Match($ConnectionString, '(?i)Server\s*=\s*([^;]+)')
         if ($m.Success) { $m.Groups[1].Value.Trim() } else { '(connection string)' }
-    } elseif (-not [string]::IsNullOrWhiteSpace($ComputerName)) {
-        $ComputerName.Trim()
+    } elseif (-not [string]::IsNullOrWhiteSpace($Computer)) {
+        $Computer.Trim()
     } else {
         'localhost'
     }
@@ -147,9 +190,9 @@ function Scan-SQLDatabase {
     $connDb = $null
     $connMaster = $null
     try {
-        $connDb = Build-SqlConnection -ConnectionString $ConnectionString -ComputerName $ComputerName -Credential $Credential -Database $Database
+        $connDb = Build-SqlConnection -ConnectionString $ConnectionString -ComputerName $Computer -Credential $Credential -Database $Database
         # Master connection shares the same auth but targets master
-        $connMaster = Build-SqlConnection -ConnectionString $null -ComputerName (if (-not [string]::IsNullOrWhiteSpace($ComputerName)) { $ComputerName } else { 'localhost' }) -Credential $Credential -Database 'master'
+        $connMaster = Build-SqlConnection -ConnectionString $null -ComputerName (if (-not [string]::IsNullOrWhiteSpace($Computer)) { $Computer } else { 'localhost' }) -Credential $Credential -Database 'master'
     } catch {
         # If master connection fails, we can still proceed with DB-only connection
         if (-not $connDb) {
@@ -326,8 +369,13 @@ function Scan-SQLDatabase {
     $failCount = (Get-SafeCount $failResults)
     $totalCount = (Get-SafeCount $results)
 
-    if ($OutputJson) {
-        $results | ConvertTo-Json -Depth 8
+    if ($outputNeedsConversion) {
+        # Convert to CSV or TSV
+        $delimiter = if ($Output -eq 'CSV') { ',' } else { "`t" }
+        $flatResults = $results | Select-Object RuleId, @{n='Status'; e={ if ($_.Pass) { 'PASS' } else { 'FAIL' } }}, Severity, RuleTitle
+        return ($flatResults | ConvertTo-Csv -NoTypeInformation -Delimiter $delimiter)
+    } elseif ($OutputJson) {
+        return ($results | ConvertTo-Json -Depth 8)
     } else {
         Write-Host "`n=== SQL Database STIG Compliance Summary ===" -ForegroundColor Cyan
         Write-Host "Target: $targetLabel" -ForegroundColor White

@@ -18,6 +18,9 @@ $script:CimSession            = $null
 . "$PSScriptRoot\Private\Criteria.ps1"
 . "$PSScriptRoot\Private\Output.ps1"
 . "$PSScriptRoot\Private\SqlHelpers.ps1"
+. "$PSScriptRoot\Private\VulnerabilityDownload.ps1"
+. "$PSScriptRoot\Private\RemotePowerSCAPManagement.ps1"
+. "$PSScriptRoot\Private\LinuxHelpers.ps1"
 
 # --- Public commands ---
 . "$PSScriptRoot\Public\Scan-Computer.ps1"
