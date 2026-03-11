@@ -4,7 +4,7 @@ function Scan-Computer {
   Scans a Windows or Linux system for security compliance, vulnerabilities, patches, or inventory using OVAL/SCAP definitions.
 
 .DESCRIPTION
-  PowerSCAP v2.6.0 - Cross-platform security scanning with automatic role detection, platform filtering,
+  PowerSCAP v2.6.1 - Cross-platform security scanning with automatic role detection, platform filtering,
   and intelligent remote scanning capabilities. Supports SCAP/STIG compliance scanning and OVAL vulnerability scanning
   on both Windows and Linux systems. Requires PowerShell 7.0+ for Linux support.
 
@@ -112,7 +112,7 @@ function Scan-Computer {
   Downloads OVAL definitions, scans remote server with temporary PowerSCAP installation.
 
 .NOTES
-  PowerSCAP v2.6.0 - Cross-platform parameter interface with full Linux support
+  PowerSCAP v2.6.1 - Cross-platform parameter interface with full Linux support
 #>
     [CmdletBinding()]
     param(
@@ -901,6 +901,7 @@ function Scan-Computer {
     $script:states = @{}
     $script:tests = @{}
     $script:xccdfRules = @{}
+    $script:ovalParentDefs = @{}  # Reverse extend_definition map: child_def_id -> [parent_def_id, ...] for severity inheritance
     
     # Track which definitions came from which files (for reporting)
     $definitionSources = @{}
@@ -1046,7 +1047,24 @@ function Scan-Computer {
                     if (-not $script:definitions.ContainsKey($defId)) {
                         $script:definitions[$defId] = $def
                         $definitionSources[$defId] = $filePath
-                        
+
+                        # Build reverse extend_definition map so child sub-definitions can
+                        # later inherit severity from parent definitions that reference them.
+                        # e.g. windows11:def:278926 extends defs:def:278942; the child
+                        # (defs:def:278942) has no XCCDF rule, so we record its parent here.
+                        $extendNodes = Select-XmlNodes -Xml $def -XPath ".//*[local-name()='extend_definition']"
+                        foreach ($extNode in $extendNodes) {
+                            $extRef = Get-AttrValue -Node $extNode -Name 'definition_ref'
+                            if ($extRef) {
+                                if (-not $script:ovalParentDefs.ContainsKey($extRef)) {
+                                    $script:ovalParentDefs[$extRef] = [System.Collections.Generic.List[string]]::new()
+                                }
+                                if (-not $script:ovalParentDefs[$extRef].Contains($defId)) {
+                                    [void]$script:ovalParentDefs[$extRef].Add($defId)
+                                }
+                            }
+                        }
+
                         # Extract severity from metadata if not from XCCDF
                         if (-not $script:xccdfRules.ContainsKey($defId)) {
                             $severityNode = Select-XmlNode -Xml $def -XPath "./*[local-name()='metadata']/*[local-name()='severity']"
@@ -1118,6 +1136,59 @@ function Scan-Computer {
     }
     
     Write-Verbose "Loaded $($script:definitions.Count) definitions, $($script:tests.Count) tests, $($script:objects.Count) objects, $($script:states.Count) states"
+
+    # Propagate severity to helper/sub-definitions via the reverse extend_definition map.
+    # SCAP content often contains shared compliance sub-definitions (e.g. defs:def:278942)
+    # that are extended by a parent definition (e.g. windows11:def:278926) which has an
+    # XCCDF Rule and therefore a known severity.  Because only the parent appears in an
+    # XCCDF <check-content-ref>, the child ends up with no entry in $script:xccdfRules.
+    # We fix that here by walking the reverse map and inheriting the parent's severity.
+    if ($script:ovalParentDefs.Count -gt 0) {
+        # Helper: resolve an OVAL def ID to its xccdfRules entry using the same
+        # lookup strategy as the evaluation loop (direct key, then numeric suffix).
+        # Returns the matching hashtable or $null.
+        $resolveXccdfEntry = {
+            param([string]$id)
+            if ($script:xccdfRules.ContainsKey($id) -and $script:xccdfRules[$id].Severity) {
+                return $script:xccdfRules[$id]
+            }
+            # Numeric-suffix fallback: e.g. defs:def:253394 -> windows11:def:253394
+            $numMatch = [System.Text.RegularExpressions.Regex]::Match($id, ':(\d+)$')
+            if ($numMatch.Success) {
+                $suffix = $numMatch.Groups[1].Value
+                foreach ($key in $script:xccdfRules.Keys) {
+                    if ($key.EndsWith(":$suffix") -and $script:xccdfRules[$key].Severity) {
+                        return $script:xccdfRules[$key]
+                    }
+                }
+            }
+            return $null
+        }
+
+        $propagatedCount = 0
+        foreach ($childId in $script:ovalParentDefs.Keys) {
+            # Only process children that currently lack a severity entry
+            $childHasSeverity = $script:xccdfRules.ContainsKey($childId) -and $script:xccdfRules[$childId].Severity
+            if (-not $childHasSeverity) {
+                foreach ($parentId in $script:ovalParentDefs[$childId]) {
+                    $parentEntry = & $resolveXccdfEntry $parentId
+                    if ($parentEntry) {
+                        $script:xccdfRules[$childId] = @{
+                            Severity = $parentEntry.Severity
+                            Weight   = $parentEntry.Weight
+                            RuleId   = $parentEntry.RuleId
+                            CVE      = $parentEntry.CVE
+                        }
+                        $propagatedCount++
+                        break
+                    }
+                }
+            }
+        }
+        if ($propagatedCount -gt 0) {
+            Write-Verbose "Propagated severity to $propagatedCount sub-definitions via extend_definition inheritance"
+        }
+    }
 
     # Shared settings
     $script:MaxWmiRows = $MaxWmiRows

@@ -1,5 +1,43 @@
 # PowerSCAP Changelog
 
+## [2.6.2] - March 2026
+
+### Fixed
+
+- **`SqlHelpers.ps1` — `Extract-SqlQueries` complete overhaul**
+  - Validated against the full MS SQL Server 2022 Instance (80 rules) and Database (22 rules) STIG corpus; result is zero prose leaks and 105 valid queries extracted across 71 of 102 rules
+  - **`^EXECUTE\b` matched English prose** ("Execute the following SQL script:"): tightened to require a SQL token immediately after the keyword (`AS`, `sp_`, `xp_`, `schema.proc`, or `identifier(`) so prose instructions are never collected as queries
+  - **`^IF\b.*BEGIN` missed multi-line `IF` blocks**: the pattern required `BEGIN` on the same line as `IF`; real STIG checks almost always put `BEGIN` on the next line. Changed to `^IF\s*(?:\(|@@|EXISTS\s*\(|NOT\s+EXISTS\s*\(|OBJECT_ID\s*\()` so only SQL-style conditions trigger collection
+  - **`^USE` lookahead evaluated the wrong string**: the negative lookahead `[a-zA-Z_#@](?!the\b)` consumed the first letter before testing, so it saw `he` instead of `the`. Fixed by moving the lookahead before the character class
+  - **Missing `DECLARE` and `INSERT INTO` starters**: multi-statement blocks beginning with `DECLARE @table ... INSERT INTO @table EXEC sp_...` were never collected
+  - **`"Use the "` missing from prose terminators**: lines like "Use the following query to discover..." were not recognized as terminators and could bleed into an active accumulator
+  - **Mid-statement `GO` batch separators not split**: checks written as `USE master; GO ↵ SELECT ...` were sent to SQL Server as a single invalid batch. Added a post-extraction pass that splits on standalone `GO` and filters each batch through the SQL validity check
+  - **Added SQL_EMBED fallback**: prose lines containing inline SQL ("If Mirroring is in use, run the following to check: `SELECT name FROM sys.database_mirroring_endpoints`...") are now detected and the SQL suffix extracted
+  - **Added SQL_VALIDITY post-filter**: every extracted query must contain at least one SQL hallmark (`FROM`, `WHERE`, `JOIN`, `sys.`, brackets, string literals, variables, proc calls, etc.) before being returned, catching any residual prose that slips through a starter match
+
+- **`SqlHelpers.ps1` — `Build-SqlConnection`**
+  - `System.Data.SqlClient` is not included in .NET 5+ (PowerShell 7). Connection attempts previously threw a cryptic type-not-found error with no guidance. Now probes for the type at startup and throws a clear message: `"Install-Module -Name SqlServer -Force"`
+
+- **`SqlHelpers.ps1` — `Evaluate-SqlRule`**
+  - Removed dead variable `$anyQueryReturned` — it was assigned in the query loop but never read anywhere in the pass/fail logic
+
+- **`Scan-SQLDatabase.ps1` — master connection ignored `-ConnectionString`**
+  - When a `-ConnectionString` was provided, the secondary `master` connection (used to route instance-level queries like `sys.databases`, `sys.server_principals`, `sys.server_audits`, etc.) was built by discarding the user's connection string entirely and connecting to `localhost` with integrated auth — wrong server, wrong credentials, wrong TLS settings. It failed silently and fell back to `$connMaster = $null`, meaning all instance-level queries ran in the wrong database context. Fixed by mutating the `Database=` clause of the provided connection string to `master` rather than rebuilding from scratch
+
+---
+
+## [2.6.1] - March 2026
+
+### Fixed
+
+- **`Scan-Computer.ps1` — Missing severity on sub-definitions**
+  - Definitions that appear as building blocks via `<extend_definition>` (e.g. shared `class=compliance` helpers) had no XCCDF Rule referencing them directly and therefore no entry in `$script:xccdfRules`. Their severity was blank in scan output
+  - Built a reverse `$script:ovalParentDefs` map during OVAL collection (child → parents) and added a post-load propagation pass that walks the map and copies severity from the nearest parent with a known XCCDF entry
+  - The propagation resolver uses direct key lookup first, then a numeric-suffix fallback to handle namespace mismatches in multi-hop `extend_definition` chains
+  - Fixes ~15 definitions across the Windows 11 V2R7 STIG that previously reported blank severity
+
+---
+
 ## [2.6.0] - February 2026
 
 ### Hotfix (February 4, 2026)
@@ -138,7 +176,7 @@
 - CIM session handling
 - Error handling improvements
 
-## [2.4.0] - January 2026
+## [2.4.0] 
 
 ### Changed
 - Complete parameter interface redesign for better usability
@@ -151,7 +189,7 @@
 - Platform filtering for vulnerability scans
 - Force role override capability
 
-## [2.3.0] - December 2025
+## [2.3.0]
 
 ### Added
 - Download capabilities for vulnerability definitions
@@ -159,21 +197,21 @@
 - MSRC security update integration
 - OVAL archive support
 
-## [2.2.0] - November 2025
+## [2.2.0]
 
 ### Added
 - XCCDF STIG parsing capabilities
 - SQL Server STIG support
 - Enhanced OVAL evaluation
 
-## [2.1.0] - October 2025
+## [2.1.0]
 
 ### Added
 - Remote scanning via CIM
 - Multiple OVAL file processing
 - JSON output support
 
-## [2.0.0] - September 2025
+## [2.0.0] 
 
 ### Changed
 - Major refactor to modular architecture

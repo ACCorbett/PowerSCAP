@@ -191,8 +191,23 @@ function Scan-SQLDatabase {
     $connMaster = $null
     try {
         $connDb = Build-SqlConnection -ConnectionString $ConnectionString -ComputerName $Computer -Credential $Credential -Database $Database
-        # Master connection shares the same auth but targets master
-        $connMaster = Build-SqlConnection -ConnectionString $null -ComputerName (if (-not [string]::IsNullOrWhiteSpace($Computer)) { $Computer } else { 'localhost' }) -Credential $Credential -Database 'master'
+
+        # Master connection: targets the same server/auth as the DB connection but uses the
+        # master database for instance-level catalog queries.
+        # When a ConnectionString was provided, mutate its Database= clause rather than
+        # building from scratch (which would silently fall back to localhost).
+        $masterConnStr = $null
+        if (-not [string]::IsNullOrWhiteSpace($ConnectionString)) {
+            if ($ConnectionString -match '(?i)database\s*=\s*[^;]+') {
+                $masterConnStr = $ConnectionString -replace '(?i)database\s*=\s*[^;]+', 'Database=master'
+            } else {
+                $sep = if ($ConnectionString.TrimEnd().EndsWith(';')) { '' } else { ';' }
+                $masterConnStr = "$ConnectionString${sep}Database=master"
+            }
+            $connMaster = Build-SqlConnection -ConnectionString $masterConnStr -ComputerName $null -Credential $null -Database $null
+        } else {
+            $connMaster = Build-SqlConnection -ConnectionString $null -ComputerName (if (-not [string]::IsNullOrWhiteSpace($Computer)) { $Computer } else { 'localhost' }) -Credential $Credential -Database 'master'
+        }
     } catch {
         # If master connection fails, we can still proceed with DB-only connection
         if (-not $connDb) {

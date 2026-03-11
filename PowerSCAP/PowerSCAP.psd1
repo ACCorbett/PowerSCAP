@@ -1,6 +1,6 @@
 @{
     RootModule        = 'PowerSCAP.psm1'
-    ModuleVersion     = '2.6.0'
+    ModuleVersion     = '2.6.2'
     GUID              = '4654b0fe-0081-47cc-8920-274ac0e22c4f'
     Author            = 'Adam Corbett'
     CompanyName       = ''

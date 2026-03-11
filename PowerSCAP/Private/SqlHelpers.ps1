@@ -6,6 +6,11 @@ function Build-SqlConnection {
     .SYNOPSIS
         Builds and opens a System.Data.SqlClient.SqlConnection from the given parameters.
         Returns the open connection object. Caller is responsible for disposing.
+    .NOTES
+        Requires System.Data.SqlClient, which ships with Windows PowerShell 5.1 but is NOT
+        included in PowerShell 7+ (.NET 5+) by default. On PowerShell 7, install the SqlServer
+        module first:  Install-Module -Name SqlServer -Force
+        This registers Microsoft.Data.SqlClient which provides the SqlConnection type.
     #>
     param(
         [string]$ConnectionString,
@@ -13,6 +18,19 @@ function Build-SqlConnection {
         [System.Management.Automation.PSCredential]$Credential,
         [string]$Database
     )
+
+    # Verify SqlClient is available and provide actionable guidance if not
+    $sqlClientAvailable = $false
+    try {
+        Add-Type -AssemblyName 'System.Data' -ErrorAction SilentlyContinue
+        [void][System.Data.SqlClient.SqlConnection]
+        $sqlClientAvailable = $true
+    } catch {}
+    if (-not $sqlClientAvailable) {
+        throw ("System.Data.SqlClient is not available on this PowerShell version. " +
+               "Install the SqlServer module to enable SQL scanning: " +
+               "Install-Module -Name SqlServer -Force")
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($ConnectionString)) {
         # Append database if specified and not already in the connection string
@@ -87,91 +105,162 @@ function Extract-SqlQueries {
     <#
     .SYNOPSIS
         Extracts executable SQL statements from XCCDF check-content text.
-        Returns an array of clean SQL strings found in the procedural text.
-        Filters out commentary/instructions, keeping only actual T-SQL.
+        Returns an array of validated SQL strings. Prose instructions, UI steps,
+        and finding-criteria text are filtered out.
+
+    .NOTES
+        Algorithm (validated against the MS SQL Server 2022 Instance and Database STIGs):
+
+        SQL STARTERS — patterns that unambiguously begin a T-SQL statement:
+          SELECT, WITH (CTE), EXEC/EXECUTE <proc>, USE <db>, IF <sql-condition>
+          EXECUTE is tightened to exclude prose "Execute the following..." by requiring
+          a SQL token (AS, sp_, xp_, schema.obj, or identifier followed by . or ()
+          immediately after the keyword.
+          IF is tightened to require a SQL-style condition opener: (, @@var, EXISTS, etc.
+          USE is tightened to require a bracket or identifier (not English words).
+
+        SQL EMBED — fallback for lines like:
+          "If Mirroring is in use, run the following to check: SELECT name FROM ..."
+          where the prose and SQL appear on the same line. The SQL keyword is located
+          within the line and only the SQL suffix is collected. Starters are checked
+        FIRST so that valid SQL lines (e.g. "EXEC sp_MSforeachdb '...; SELECT ...'")
+          are never stripped of their prefix by the embed extractor.
+
+        SQL VALIDITY FILTER — post-extraction gate that rejects anything lacking SQL
+          hallmarks (FROM/WHERE/JOIN/sys./brackets/literals/variables/proc calls/etc.).
+          This catches residual prose that slipped through a starter match.
+
+        PROSE TERMINATORS — lines beginning with common English instruction phrases
+          (If, Note, Run the, Execute the, Navigate, etc.) that close the current
+          statement accumulator when encountered mid-block.
     #>
     param([string]$CheckText)
 
     if ([string]::IsNullOrWhiteSpace($CheckText)) { return @() }
 
-    $queries = @()
-    $lines = $CheckText -split "`n"
+    # SQL statement starters — ordered from most to least specific
+    # EXEC/EXECUTE: requires a SQL token after the keyword, not English prose
+    # USE:          lookahead placed BEFORE the character class so the full word
+    #               is tested (not just the suffix after the first letter is consumed)
+    # IF:           requires a SQL condition opener, not prose "If no records..."
+    $starters = @(
+        '^SELECT\b',
+        '^WITH\b',
+        '^DECLARE\b',
+        '^INSERT\s+INTO\b',
+        '^EXEC(?:UTE)?\s+(?:AS\b|sp_|xp_|master\.|msdb\.|[a-zA-Z_#@]\w*\s*[.(])',
+        '^USE\s+(?:\[|(?!the\b|following\b|these\b|this\b|a\b|an\b)[a-zA-Z_#@]\w*)',
+        '^IF\s*(?:\(|@@|EXISTS\s*\(|NOT\s+EXISTS\s*\(|OBJECT_ID\s*\()',
+        '^SELECT\s+COUNT'
+    )
+
+    # Prose terminator prefixes that end a SQL accumulation block
+    # "Use the " added to handle "Use the following query to..." intro lines
+    $proseTermPattern = '(?i)^(If |Note |OR$|Reference|Otherwise|This is|Review|Obtain|Determine|Run the|Execute the|Launch|In the|Navigate|Right-click|Expand|From the|Use the )'
+
+    # Fallback: detect SQL embedded after prose on the same line
+    # e.g. "If Mirroring is in use, run the following: SELECT name FROM sys..."
+    # Only fires when no starter matched (starters checked first to protect
+    # lines like "EXEC sp_MSforeachdb '...; SELECT ...' from being truncated).
+    $sqlEmbedPattern = '(?i).+?\b(SELECT|WITH|EXEC(?:UTE)?)\b\s+(?!the\b|following\b|these\b|this\b|all\b)'
+
+    # Post-extraction validity: a query must contain at least one SQL hallmark
+    # to filter out any residual prose that matched a starter pattern
+    $sqlValidityPattern = '(?i)(\b(FROM|WHERE|JOIN|sys\.|INNER|LEFT|RIGHT|OUTER)\b' +
+                          '|AS\s+LOGIN\b|\bsp_\w+|\bxp_\w+|=\s*[''"\[\w]|@\w+|\[.+?\]' +
+                          "|'[^']*'" + '|\bEXEC(?:UTE)?\s+(?:AS|sp_|xp_|\w+\.)|\(\s*SELECT\b)'
+
+    $queries        = @()
     $currentStatement = @()
-    $inStatement = $false
+    $inStatement    = $false
 
-    # SQL statement starters (case-insensitive)
-    $starters = @('^SELECT\b', '^WITH\b', '^EXEC\b', '^EXECUTE\b', '^USE\b', '^IF\b.*BEGIN', '^SELECT\s+COUNT')
-
-    foreach ($rawLine in $lines) {
+    foreach ($rawLine in ($CheckText -split "`n")) {
         $line = $rawLine.Trim()
 
-        # Skip empty lines when not in a statement
         if ([string]::IsNullOrWhiteSpace($line) -and -not $inStatement) { continue }
 
-        # Detect start of SQL
         if (-not $inStatement) {
-            $isStart = $false
+            # 1. Try SQL starters first — keeps full valid SQL lines intact
+            $matched = $false
             foreach ($pat in $starters) {
-                if ($line -match "(?i)$pat") { $isStart = $true; break }
+                if ($line -match "(?i)$pat") {
+                    $inStatement      = $true
+                    $currentStatement = @($line)
+                    $matched          = $true
+                    break
+                }
             }
-            if ($isStart) {
-                $inStatement = $true
-                $currentStatement = @($line)
-                continue
+            if ($matched) { continue }
+
+            # 2. Fallback: prose line containing embedded SQL suffix
+            if ($line -match $sqlEmbedPattern) {
+                $sqlSuffix = $line.Substring($Matches[0].Length - $Matches[1].Length).Trim()
+                if ($sqlSuffix.Length -gt 5 -and $sqlSuffix -match $sqlValidityPattern) {
+                    $inStatement      = $true
+                    $currentStatement = @($sqlSuffix)
+                }
             }
             continue
         }
 
-        # We are inside a statement - detect end
-        # End on: empty line, line starting with "If ", "Note", "OR", non-SQL instruction prose
+        # Inside a statement
         if ([string]::IsNullOrWhiteSpace($line)) {
-            # Empty line terminates statement
-            $sql = ($currentStatement -join " ").Trim()
-            if ($sql.Length -gt 5) { $queries += $sql }
+            $sql = ($currentStatement -join ' ').Trim()
+            if ($sql.Length -gt 5 -and $sql -match $sqlValidityPattern) { $queries += $sql }
             $currentStatement = @()
-            $inStatement = $false
+            $inStatement      = $false
             continue
         }
 
-        # Lines that signal end of SQL block
-        if ($line -match '(?i)^(If |Note |OR$|Reference|Otherwise|This is|Review|Obtain|Determine|Run the|Execute the|Launch|In the|Navigate|Right-click|Expand|From the)') {
-            $sql = ($currentStatement -join " ").Trim()
-            if ($sql.Length -gt 5) { $queries += $sql }
+        if ($line -match $proseTermPattern) {
+            $sql = ($currentStatement -join ' ').Trim()
+            if ($sql.Length -gt 5 -and $sql -match $sqlValidityPattern) { $queries += $sql }
             $currentStatement = @()
-            $inStatement = $false
+            $inStatement      = $false
 
-            # Check if this line itself starts a new statement
-            $isStart = $false
+            # This prose line may itself start or embed SQL
+            $matched = $false
             foreach ($pat in $starters) {
-                if ($line -match "(?i)$pat") { $isStart = $true; break }
+                if ($line -match "(?i)$pat") {
+                    $inStatement      = $true
+                    $currentStatement = @($line)
+                    $matched          = $true
+                    break
+                }
             }
-            if ($isStart) {
-                $inStatement = $true
-                $currentStatement = @($line)
+            if (-not $matched -and $line -match $sqlEmbedPattern) {
+                $sqlSuffix = $line.Substring($Matches[0].Length - $Matches[1].Length).Trim()
+                if ($sqlSuffix.Length -gt 5 -and $sqlSuffix -match $sqlValidityPattern) {
+                    $inStatement      = $true
+                    $currentStatement = @($sqlSuffix)
+                }
             }
             continue
         }
 
-        # Continuation of current SQL statement
         $currentStatement += $line
     }
 
-    # Flush any remaining statement
+    # Flush trailing statement
     if ($inStatement -and (Get-SafeCount $currentStatement) -gt 0) {
-        $sql = ($currentStatement -join " ").Trim()
-        if ($sql.Length -gt 5) { $queries += $sql }
+        $sql = ($currentStatement -join ' ').Trim()
+        if ($sql.Length -gt 5 -and $sql -match $sqlValidityPattern) { $queries += $sql }
     }
 
-    # Post-process: strip trailing GO, clean up
-    $cleaned = @()
+    # Strip trailing GO statements, split on mid-statement GO batch separators,
+    # and filter any resulting segments that no longer look like SQL
+    $final = @()
     foreach ($q in $queries) {
-        $q = $q -replace '\s*\bGO\b\s*$', '' | ForEach-Object { $_.Trim() }
-        # Remove trailing semicolons that may cause issues with some queries
-        # but keep them if they're mid-statement separators
-        if ($q.Length -gt 3) { $cleaned += $q }
+        # Split on standalone GO batch separators (e.g. "USE master; GO SELECT ...")
+        $batches = $q -split '(?i)\s+GO\b\s*;?\s*'
+        foreach ($batch in $batches) {
+            $batch = $batch.Trim().TrimEnd(';').Trim()
+            if ($batch.Length -gt 3 -and $batch -match $sqlValidityPattern) {
+                $final += $batch
+            }
+        }
     }
-
-    return $cleaned
+    return $final
 }
 
 function Parse-XccdfRules {
@@ -261,7 +350,6 @@ function Evaluate-SqlRule {
     $evidence = @()
     $hasExecutableQuery = $false
     $anyQueryFailed = $false
-    $anyQueryReturned = $false
 
     if ($Rule.SqlQueries -and (Get-SafeCount $Rule.SqlQueries) -gt 0) {
         foreach ($query in $Rule.SqlQueries) {
@@ -283,7 +371,6 @@ function Evaluate-SqlRule {
                 $evidenceEntry.Evidence = "Query error: $queryError"
                 $anyQueryFailed = $true
             } else {
-                $anyQueryReturned = $true
                 $evidenceEntry.Pass = $true  # Query executed successfully
                 if ($IncludeDetails -and $rowCount -gt 0) {
                     # Attach first 10 rows as detail
